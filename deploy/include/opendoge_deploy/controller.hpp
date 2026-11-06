@@ -4,7 +4,7 @@
 #include <string>
 
 #include "opendoge_deploy/cli.hpp"
-#include "opendoge_deploy/el05_socketcan.hpp"
+#include "el05_socketcan.hpp"
 #include "opendoge_deploy/types.hpp"
 
 namespace opendoge
@@ -35,6 +35,7 @@ void updateStateMachine(
   double t,
   double & pc_startup_start_s,
   double & feedback_wait_start_s,
+  double & standup_start_s,
   std::string & fault_reason);
 
 /// Per-tick PD control: computes MotorCommand for each joint based on
@@ -50,7 +51,8 @@ void computeMotorCommands(
   const std::array<double, kNumJoints> & limited_target,
   const std::array<double, kNumJoints> & default_pos,
   double t,
-  double pc_startup_start_s);
+  double pc_startup_start_s,
+  double standup_start_s);
 
 /// Target update block (200 Hz): computes logical targets from actions,
 /// applies rate limiting and joint limits.

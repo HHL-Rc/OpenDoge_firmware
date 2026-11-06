@@ -2,8 +2,11 @@
 
 #include <cstdio>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <thread>
+
+#include <unistd.h>
 
 namespace opendoge
 {
@@ -55,6 +58,7 @@ void emitStatus(
   const std::string & fault_reason,
   bool rl_fallback_active,
   const std::array<MotorState, kNumJoints> & states,
+  const std::array<double, kNumJoints> & limited_target,
   const std::array<JointCalibration, kNumJoints> & calib,
   const std::array<JointMap, kNumJoints> & joints,
   const ImuSample & imu,
@@ -64,27 +68,82 @@ void emitStatus(
 {
   const auto sent_delta = can_stats.frames_sent - last_can_sent;
   const auto recv_delta = can_stats.frames_received - last_can_received;
-  std::cout << "state=" << stateName(runtime_state)
-            << " active_cmd=" << (command.active ? 1 : 0)
-            << " pos_ctrl=" << (command.position_control ? 1 : 0)
-            << " rl_infer=" << (command.rl_inference ? 1 : 0)
-            << " low_gain=" << (command.low_gain_mode ? 1 : 0)
-            << " imu=" << (imu.valid ? 1 : 0)
-            << " ctrl_ticks=" << loop_stats.control_ticks
-            << " infer_ticks=" << loop_stats.inference_ticks
-            << " target_ticks=" << loop_stats.target_ticks
-            << " max_late_us=" << static_cast<int>(loop_stats.max_control_late_s * 1.0e6)
-            << " missed_ctrl=" << loop_stats.missed_control_deadlines
-            << " can_tx=" << sent_delta
-            << " can_rx=" << recv_delta
-            << " can_err=" << (can_stats.read_errors + can_stats.write_errors)
-            << " ramp_pct=" << (runtime_state == RuntimeState::EnteringPosition
-              ? static_cast<int>(100.0 * (t - pc_startup_start_s) / pc_startup_ramp_s) : 100)
-            << " rl_fb=" << (rl_fallback_active ? 1 : 0);
-  if (runtime_state == RuntimeState::DampingFault) {
-    std::cout << " fault=\"" << fault_reason << "\"";
+  // Interactive terminal: print a watch-like table. Redirected output keeps
+  // the compact one-line format (logs/scripts).
+  if (::isatty(STDOUT_FILENO) != 0) {
+    std::cout << "state=" << stateName(runtime_state)
+              << " active=" << (command.active ? 1 : 0)
+              << " pos_ctrl=" << (command.position_control ? 1 : 0)
+              << " rl=" << (command.rl_inference ? 1 : 0)
+              << " low_gain=" << (command.low_gain_mode ? 1 : 0)
+              << " estop=" << (command.estop ? 1 : 0)
+              << " imu=" << (imu.valid ? 1 : 0)
+              << " can_tx=" << sent_delta
+              << " can_rx=" << recv_delta
+              << " err=" << (can_stats.read_errors + can_stats.write_errors)
+              << " late_us=" << static_cast<int>(loop_stats.max_control_late_s * 1.0e6)
+              << " missed=" << loop_stats.missed_control_deadlines
+              << " ramp_pct=" << (runtime_state == RuntimeState::EnteringPosition
+                ? static_cast<int>(100.0 * (t - pc_startup_start_s) / pc_startup_ramp_s) : 100);
+    if (runtime_state == RuntimeState::DampingFault) {
+      std::cout << " fault=\"" << fault_reason << "\"";
+    }
+    std::cout << "\n";
+    std::cout << "  " << std::left << std::setw(16) << "joint"
+              << std::right << std::setw(10) << "q"
+              << std::setw(10) << "q_cmd"
+              << std::setw(9) << "dq"
+              << std::setw(9) << "tau"
+              << std::setw(9) << "tau_j"
+              << std::setw(7) << "temp"
+              << std::setw(7) << "fault"
+              << std::setw(9) << "age_ms"
+              << std::setw(6) << "recv" << "\n";
+    for (std::size_t i = 0; i < kNumJoints; ++i) {
+      const double q = logicalPosition(states[i].position, calib[i]);
+      const double dq = logicalVelocity(states[i].velocity, calib[i]);
+      const double tau = states[i].torque;
+      const double tau_j = tau * calib[i].reduction;  // same scaling as the safety check
+      const double age_ms = states[i].received
+        ? (t - states[i].last_feedback_s) * 1000.0 : -1.0;
+      std::cout << "  " << std::left << std::setw(16) << joints[i].name
+                << std::right << std::fixed << std::setprecision(4)
+                << std::setw(10) << q
+                << std::setw(10) << limited_target[i]
+                << std::setprecision(3)
+                << std::setw(9) << dq
+                << std::setw(9) << tau
+                << std::setw(9) << tau_j
+                << std::setprecision(1)
+                << std::setw(7) << states[i].temperature
+                << std::setw(7) << states[i].fault
+                << std::setw(9) << static_cast<long long>(age_ms)
+                << std::setw(6) << (states[i].received ? "yes" : "no") << "\n";
+    }
+    std::cout << std::defaultfloat << std::setprecision(6);
+  } else {
+    std::cout << "state=" << stateName(runtime_state)
+              << " active_cmd=" << (command.active ? 1 : 0)
+              << " pos_ctrl=" << (command.position_control ? 1 : 0)
+              << " rl_infer=" << (command.rl_inference ? 1 : 0)
+              << " low_gain=" << (command.low_gain_mode ? 1 : 0)
+              << " imu=" << (imu.valid ? 1 : 0)
+              << " ctrl_ticks=" << loop_stats.control_ticks
+              << " infer_ticks=" << loop_stats.inference_ticks
+              << " target_ticks=" << loop_stats.target_ticks
+              << " max_late_us=" << static_cast<int>(loop_stats.max_control_late_s * 1.0e6)
+              << " missed_ctrl=" << loop_stats.missed_control_deadlines
+              << " can_tx=" << sent_delta
+              << " can_rx=" << recv_delta
+              << " can_err=" << (can_stats.read_errors + can_stats.write_errors)
+              << " ramp_pct=" << (runtime_state == RuntimeState::EnteringPosition
+                ? static_cast<int>(100.0 * (t - pc_startup_start_s) / pc_startup_ramp_s) : 100)
+              << " rl_fb=" << (rl_fallback_active ? 1 : 0);
+    if (runtime_state == RuntimeState::DampingFault) {
+      std::cout << " fault=\"" << fault_reason << "\"";
+    }
+    std::cout << "\n";
   }
-  std::cout << "\n";
 
   // Write JSON status snapshot for external consumers (web console, etc.)
   if (!status_file.empty()) {
@@ -117,10 +176,14 @@ void emitStatus(
         const double logical_pos = logicalPosition(states[i].position, calib[i]);
         sf << "{\"n\":\"" << joints[i].name << "\","
            << "\"q\":" << logical_pos << ","
+           << "\"target\":" << limited_target[i] << ","
            << "\"dq\":" << logicalVelocity(states[i].velocity, calib[i]) << ","
            << "\"tau\":" << states[i].torque << ","
            << "\"temp\":" << states[i].temperature << ","
            << "\"fault\":" << states[i].fault << ","
+           << "\"fault_sta\":" << states[i].param_fault << ","
+           << "\"age_ms\":" << static_cast<long long>(
+                states[i].received ? (t - states[i].last_feedback_s) * 1000.0 : -1.0) << ","
            << "\"recv\":" << (states[i].received ? "true" : "false") << "}";
       }
       sf << "],";

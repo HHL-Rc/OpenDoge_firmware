@@ -91,13 +91,14 @@ def remap_quat(q: Tuple[float, float, float, float], order, signs) -> Tuple[floa
 
 
 def atomic_write(path: str, text: str) -> None:
+    # Latest-value IPC file: the deploy polls it at 200 Hz. fsync on ext4
+    # (/tmp is not tmpfs here) is unnecessary for this and very costly at 1 kHz.
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     tmp_path = f"{path}.tmp.{os.getpid()}"
     with open(tmp_path, "w", encoding="utf-8") as file:
         file.write(text)
         file.flush()
-        os.fsync(file.fileno())
     os.replace(tmp_path, path)
 
 
@@ -112,6 +113,10 @@ def format_imu_state(gyro: Tuple[float, float, float], gravity: Tuple[float, flo
     )
 
 
+class DeviceLostError(RuntimeError):
+    """USB serial device disappeared or was re-enumerated to a new tty."""
+
+
 class SerialActiveReader:
     def __init__(self, device: str, baud: int, check_crc: bool):
         self.device = device
@@ -119,10 +124,12 @@ class SerialActiveReader:
         self.check_crc = check_crc
         self.fd: Optional[int] = None
         self.buffer = bytearray()
+        self.real_path: Optional[str] = None
 
     def __enter__(self) -> "SerialActiveReader":
         self.fd = os.open(self.device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         configure_serial(self.fd, self.baud)
+        self.real_path = os.path.realpath(self.device)
         return self
 
     def __exit__(self, *_args) -> None:
@@ -133,10 +140,23 @@ class SerialActiveReader:
     def read_updates(self) -> Iterable[Tuple[int, Tuple[float, ...]]]:
         if self.fd is None:
             return []
+        # A /dev/serial/by-id symlink is retargeted on USB re-enumeration
+        # (ttyACM0 -> ttyACM1). The old fd then reads nothing forever, which
+        # showed up as "IMU update timeout" while the service stayed alive.
+        # Detect the retarget and let main() reopen the device.
+        try:
+            current = os.path.realpath(self.device)
+        except OSError as exc:
+            raise DeviceLostError(str(exc)) from exc
+        if self.real_path and current != self.real_path:
+            raise DeviceLostError(
+                f"{self.device} -> {current} (was {self.real_path})")
         try:
             chunk = os.read(self.fd, 4096)
         except BlockingIOError:
             chunk = b""
+        except OSError as exc:
+            raise DeviceLostError(str(exc)) from exc
         if chunk:
             self.buffer.extend(chunk)
         return parse_serial_frames(self.buffer, self.check_crc)
@@ -144,7 +164,10 @@ class SerialActiveReader:
     def write(self, data: bytes) -> None:
         if self.fd is None:
             raise RuntimeError("serial device is not open")
-        os.write(self.fd, data)
+        try:
+            os.write(self.fd, data)
+        except OSError as exc:
+            raise DeviceLostError(str(exc)) from exc
 
 
 def configure_serial(fd: int, baud: int) -> None:
@@ -327,20 +350,42 @@ def parse_args():
     )
     parser.add_argument("--save-config", action="store_true", help="Save settings when used with --configure-usb")
     parser.add_argument("--check-crc", action="store_true", help="Validate USB serial CRC16 before accepting frames")
+    parser.add_argument(
+        "--gyro-lowpass-hz", type=float, default=0.0,
+        help="Low-pass filter cutoff for wx/wy/wz (0=off). 40-60 Hz suppresses "
+             "real-world foot-impact vibration; adds ~1/(2*pi*f) phase lag.")
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 
 
-def run(reader, output: str, order, signs, timeout_s: float, quiet: bool) -> int:
+def run(reader, output: str, order, signs, timeout_s: float, quiet: bool,
+        lowpass_hz: float = 0.0) -> int:
     state = ImuState()
     next_status_s = 0.0
+    next_write_s = 0.0
+    filtered_gyro = None
     while True:
         for frame_type, values in reader.read_updates():
             apply_update(state, frame_type, values, order, signs)
-        if state.ready():
-            gravity = quat_rotate_inverse(state.quat, (0.0, 0.0, -1.0))  # type: ignore[arg-type]
-            atomic_write(output, format_imu_state(state.gyro, gravity))  # type: ignore[arg-type]
         now_s = time.monotonic()
+        # The deploy polls the file at 200 Hz; writing faster than that just
+        # burns CPU/disk (the old loop wrote 1 kHz, with fsync).
+        if state.ready() and now_s >= next_write_s:
+            gravity = quat_rotate_inverse(state.quat, (0.0, 0.0, -1.0))  # type: ignore[arg-type]
+            gyro = state.gyro
+            if lowpass_hz > 0.0 and gyro is not None:
+                # First-order IIR at the 200 Hz write rate. Default off so the
+                # training contract (raw rad/s gyro) is unchanged; 40-60 Hz is
+                # a useful sim2real filter for foot-impact vibration.
+                alpha = 1.0 - math.exp(-2.0 * math.pi * lowpass_hz * 0.005)
+                if filtered_gyro is None:
+                    filtered_gyro = list(gyro)
+                else:
+                    for i in range(3):
+                        filtered_gyro[i] += alpha * (gyro[i] - filtered_gyro[i])
+                gyro = tuple(filtered_gyro)
+            atomic_write(output, format_imu_state(gyro, gravity))  # type: ignore[arg-type]
+            next_write_s = now_s + 0.005
         if not quiet and now_s >= next_status_s:
             age = now_s - state.last_update_s if state.last_update_s else float("inf")
             print(f"ready={int(state.ready())} age_ms={age * 1000.0:.1f} output={output}")
@@ -358,12 +403,30 @@ def main() -> int:
             if not args.device:
                 print("--device is required for --source serial", file=sys.stderr)
                 return 1
-            with SerialActiveReader(args.device, args.baud, args.check_crc) as reader:
-                if args.configure_usb:
-                    send_usb_setup(reader, args.save_config)
-                return run(reader, args.output, order, signs, args.timeout_sec, args.quiet)
-        with CanReader(args.can, args.can_id) as reader:
-            return run(reader, args.output, order, signs, args.timeout_sec, args.quiet)
+            factory = lambda: SerialActiveReader(  # noqa: E731
+                args.device, args.baud, args.check_crc)
+            configure = args.configure_usb
+            label = args.device
+        else:
+            factory = lambda: CanReader(args.can, args.can_id)  # noqa: E731
+            configure = False
+            label = args.can
+
+        # USB re-enumeration (ttyACM0 -> ttyACM1) invalidates the open fd.
+        # The old loop kept the dead fd and printed "IMU update timeout"
+        # forever; reopen and re-send --configure-usb instead.
+        while True:
+            try:
+                with factory() as reader:
+                    if configure:
+                        send_usb_setup(reader, args.save_config)
+                    return run(reader, args.output, order, signs,
+                               args.timeout_sec, args.quiet,
+                               args.gyro_lowpass_hz)
+            except (DeviceLostError, FileNotFoundError, OSError) as exc:
+                print(f"[reconnect] IMU lost ({label}): {exc}; "
+                      f"waiting for device ...", file=sys.stderr)
+                time.sleep(1.0)
     except KeyboardInterrupt:
         return 0
 

@@ -23,7 +23,7 @@
     <mesh name="RR_foot" file="RR_foot.STL" />
   </asset>
 
-  <default><joint limited="true" damping="0.5" frictionloss="0.2" armature="0.01" /><geom contype="1" conaffinity="1" /></default><worldbody>
+  <default><joint limited="true" damping="0" frictionloss="0" armature="0.005" /><geom contype="1" conaffinity="1" /></default><worldbody>
     <body name="robot" pos="0 0 0.30" quat="1 0 0 0"><joint name="float_base" type="free" limited="false" /><inertial pos="0.000134773648275938 1.36367968484041e-06 0.000770353067310358" mass="2.2352588780603" fullinertia="0.0054247 0.0099197 0.013453 1.29e-06 -9.59e-05 -2e-07" /><site name="imu" pos="0 0 0.03" /><geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="base_link" contype="1" conaffinity="1" group="1" />
     <body name="FL_hip" pos="0.1425 0.039989 0">
       <inertial pos="-0.0019419 -0.00069982 1.3745e-06" quat="-0.265811 0.655274 0.265304 0.655419" mass="0.27308" diaginertia="0.00010203 8.98057e-05 8.68843e-05" />
@@ -39,7 +39,7 @@
           <geom type="mesh" rgba="0.79216 0.81961 0.93333 1" mesh="FL_calf" />
           <!-- FL foot: visual mesh (no collision) + analytical collision sphere matching URDF r=0.015 -->
           <geom pos="-1.19561e-05 0 -0.0993915" quat="1 0 0 0" type="mesh" rgba="1 1 1 1" mesh="FL_foot" contype="0" conaffinity="0" group="1" />
-          <geom type="sphere" size="0.015" pos="-1.19561e-05 0 -0.0993915" rgba="0.9 0.9 0.9 0.6" contype="1" conaffinity="1" friction="0.4 0.02 0.01" solref="0.01 1" solimp="0.015 1 0.023" margin="0.005" condim="6" />
+          <geom type="sphere" size="0.015" pos="-1.19561e-05 0 -0.0993915" rgba="0.9 0.9 0.9 0.6" contype="1" conaffinity="1" friction="0.8 0.005 0.0001" solref="0.01 1" solimp="0.9 0.95 0.023" margin="0.005" condim="3" />
         </body>
       </body>
     </body>
@@ -56,7 +56,7 @@
           <joint name="FR_calf_joint" pos="0 0 0" axis="0 1 0" range="-2.68 -1.04" />
           <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="FR_calf" />
           <geom pos="-1.19561e-05 0 -0.0993915" quat="1 0 0 0" type="mesh" rgba="1 1 1 1" mesh="FR_foot" contype="0" conaffinity="0" group="1" />
-          <geom type="sphere" size="0.015" pos="-1.19561e-05 0 -0.0993915" rgba="0.9 0.9 0.9 0.6" contype="1" conaffinity="1" friction="0.4 0.02 0.01" solref="0.01 1" solimp="0.015 1 0.023" margin="0.005" condim="6" />
+          <geom type="sphere" size="0.015" pos="-1.19561e-05 0 -0.0993915" rgba="0.9 0.9 0.9 0.6" contype="1" conaffinity="1" friction="0.8 0.005 0.0001" solref="0.01 1" solimp="0.9 0.95 0.023" margin="0.005" condim="3" />
         </body>
       </body>
     </body>
@@ -73,7 +73,7 @@
           <joint name="RL_calf_joint" pos="0 0 0" axis="0 1 0" range="-2.68 -1.04" />
           <geom type="mesh" rgba="0.79216 0.81961 0.93333 1" mesh="RL_calf" />
           <geom pos="-1.19561e-05 0 -0.0993915" quat="1 0 0 0" type="mesh" rgba="1 1 1 1" mesh="RL_foot" contype="0" conaffinity="0" group="1" />
-          <geom type="sphere" size="0.015" pos="-1.19561e-05 0 -0.0993915" rgba="0.9 0.9 0.9 0.6" contype="1" conaffinity="1" friction="0.4 0.02 0.01" solref="0.01 1" solimp="0.015 1 0.023" margin="0.005" condim="6" />
+          <geom type="sphere" size="0.015" pos="-1.19561e-05 0 -0.0993915" rgba="0.9 0.9 0.9 0.6" contype="1" conaffinity="1" friction="0.8 0.005 0.0001" solref="0.01 1" solimp="0.9 0.95 0.023" margin="0.005" condim="3" />
         </body>
       </body>
     </body>
@@ -90,7 +90,7 @@
           <joint name="RR_calf_joint" pos="0 0 0" axis="0 1 0" range="-2.68 -1.04" />
           <geom type="mesh" rgba="0.79216 0.81961 0.93333 1" mesh="RR_calf" />
           <geom pos="-1.19561e-05 0 -0.0993915" quat="1 0 0 0" type="mesh" rgba="1 1 1 1" mesh="RR_foot" contype="0" conaffinity="0" group="1" />
-          <geom type="sphere" size="0.015" pos="-1.19561e-05 0 -0.0993915" rgba="0.9 0.9 0.9 0.6" contype="1" conaffinity="1" friction="0.4 0.02 0.01" solref="0.01 1" solimp="0.015 1 0.023" margin="0.005" condim="6" />
+          <geom type="sphere" size="0.015" pos="-1.19561e-05 0 -0.0993915" rgba="0.9 0.9 0.9 0.6" contype="1" conaffinity="1" friction="0.8 0.005 0.0001" solref="0.01 1" solimp="0.9 0.95 0.023" margin="0.005" condim="3" />
         </body>
       </body>
     </body>

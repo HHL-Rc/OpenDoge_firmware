@@ -15,6 +15,14 @@ OpenDoge 电机控制层 — EL05/RobStride 准直驱电机的完整 CAN 协议�
 | `el05_calibrate.py` | Python | 电机标定 — 计算 JointCalibration 偏移量 (只读位置，不写零位) |
 | `protocol_selftest.py` | Python | 协议自检 — 无硬件离线验证帧打包/解包一致性 |
 | `scan_motors_readonly.py` | Python | 只读扫描 — 发现全部电机并读取参数 (不使能、不写参数) |
+| `watch_angles.py` | Python | 实时角度观察 — 只读 mechPos/mechVel/faultSta，支持重试/补扫/CSV |
+| `zero_all_motors.py` | Python | 12 电机站立位一键置零 + 写 Flash (运控→SET_ZERO→SAVE) |
+| `el05_set_can_timeout.py` | Python | 读写 0x7028 canTimeout (失联自动释放) |
+| `discover_direction.py` | Python | 只读方向检测 (手推 ΔmechPos) |
+| `record_standing.py` | Python | 只读站立位角度记录 (旧参考角，勿直接用于配置) |
+
+> 旧 DINGLAB/SOULDE USB2CAN 传输代码已归档到 `~/DingLab usb转can代码`，
+> 当前使用赤乌（CHIWU）原生 SocketCAN `can0-can3`。
 
 ## 协议一致性
 

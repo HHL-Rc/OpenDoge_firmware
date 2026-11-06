@@ -44,6 +44,7 @@ void emitStatus(
   const std::string & fault_reason,
   bool rl_fallback_active,
   const std::array<MotorState, kNumJoints> & states,
+  const std::array<double, kNumJoints> & limited_target,
   const std::array<JointCalibration, kNumJoints> & calib,
   const std::array<JointMap, kNumJoints> & joints,
   const ImuSample & imu,
