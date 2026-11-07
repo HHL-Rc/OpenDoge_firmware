@@ -64,6 +64,17 @@ struct MotorState
   bool can_timeout_received{false};
   bool received{false};
   double last_feedback_s{0.0};
+  // Per-signal freshness. A type-17 READ_PARAM reply refreshes mechPos/Vel and
+  // the joint-wide age, but does NOT refresh the type-2 status frame that
+  // carries torque/temperature/fault/mode. Keep the timestamps separate so a
+  // dead type-2 path is visible even while q/dq look fresh.
+  double last_position_s{0.0};
+  double last_velocity_s{0.0};
+  double last_status_s{0.0};
+  std::uint64_t status_frames{0};
+  std::uint64_t param_frames{0};
+  double last_gap_s{0.0};
+  double max_gap_s{0.0};
 };
 
 struct MotorCommand
@@ -75,12 +86,34 @@ struct MotorCommand
   double kd{0.0};
 };
 
+struct BusCanStats
+{
+  std::uint64_t tx{0};
+  std::uint64_t rx{0};
+  std::uint64_t read_errors{0};
+  std::uint64_t write_errors{0};
+  std::uint64_t tx_queue_full{0};
+  std::uint64_t error_frames{0};
+  std::uint64_t bus_off{0};
+  std::uint64_t restarts{0};
+  std::uint32_t tec{0};
+  std::uint32_t rec{0};
+  // "UNKNOWN", "ERROR-ACTIVE", "ERROR-WARNING", "ERROR-PASSIVE", "BUS-OFF".
+  std::string state{"UNKNOWN"};
+};
+
 struct CanStats
 {
   std::uint64_t frames_sent{0};
   std::uint64_t frames_received{0};
   std::uint64_t read_errors{0};
   std::uint64_t write_errors{0};
+  std::uint64_t tx_queue_full{0};
+  // Per-joint expected type-2 replies (incremented on sendMotion, excluding
+  // fault polls/retries). status_frames / expected_status gives the RX ratio.
+  std::array<std::uint64_t, kNumJoints> expected_status{};
+  // Bus order is can0..can3.
+  std::array<BusCanStats, 4> buses{};
 };
 
 /// Per-joint safety state for sustained-condition monitoring.
@@ -135,7 +168,7 @@ struct DeployConfig
   //   "zero"    → zeros (worst case, no state estimate)
   //   "command" → [vx, vy, 0] body-frame command approximation
   //   "imu"     → vx/vy/vz keys from the IMU state file (if the bridge provides them)
-  std::string lin_vel_source{"zero"};
+  std::string lin_vel_source{"command"};
   double state_timeout_s{0.02};
   // Scan-like feedback recovery: for joints whose last feedback is stale,
   // send a READ_PARAM (mechPos/mechVel) instead of waiting for the next
@@ -154,6 +187,13 @@ struct DeployConfig
   // At 200 Hz, 0.002 rad/tick = 0.4 rad/s (~2.6 s for the calf's 1.03 rad).
   double standup_max_position_step{0.002};
   double standup_duration_s{4.0};
+  // After the ramp reaches the default pose, hold it for this long before
+  // handing over to the policy/PC. Gives the legs and IMU time to settle.
+  double standup_settle_s{1.0};
+  // After the handover, blend the policy target from the default pose to the
+  // full action over this duration. Prevents the first large policy action
+  // from stepping the calf target and causing a jerk/fall-check spike.
+  double standup_handover_s{1.0};
   // During the stand-up ramp the target is intentionally moving, so allow a
   // larger tracking error than the normal 0.5 rad / 0.3 s check.
   double standup_tracking_error_threshold{1.0};
@@ -166,6 +206,18 @@ struct DeployConfig
   // long (bridge dead, deploy crash, lost COMM_STOP), it resets and stops
   // applying torque. 1.0 s is a good default; do not use < 0.5 s.
   double can_timeout_s{0.0};
+  // IMU/heartbeat staleness. 0 disables the check. The bridge writes in-band
+  // t=/seq= stamps; a frozen file (rewritten cache, unchanged seq) is caught
+  // by age. warn = status/monitor only; fault = DampingFault after debounce.
+  double imu_timeout_s{0.0};
+  std::string imu_stale_action{"warn"};
+  // Observation-side motor feedback staleness (0 disables). Applies to active
+  // states; hold = current behaviour, freeze = skip inference this tick,
+  // fault = DampingFault. The hard safety timeout stays state_timeout_s.
+  double feedback_hold_max_s{0.03};
+  std::string stale_action{"hold"};
+  // CAN controller error policy: warn|fault. BUS-OFF always faults.
+  std::string can_error_action{"warn"};
   // Safety monitoring thresholds
   double torque_threshold{3.0};
   double torque_timeout_s{0.5};
@@ -174,11 +226,12 @@ struct DeployConfig
   double command_timeout_s{0.5};
   double fall_gravity_z_threshold{0.3};
   double fall_timeout_s{0.3};
-  // During a supervised stand-up (LowGainTest) the robot starts prone, where
-  // projected_gravity.z ≈ 0 would trip the fall check immediately. Suppress the
-  // IMU fall check for this many seconds after entering LowGainTest, then
-  // re-enable it so a robot that fails to stand still faults.
-  double standup_grace_s{5.0};
+  // During a supervised stand-up the robot starts prone, where
+  // projected_gravity.z ≈ 0 would trip the fall check immediately. This is a
+  // time window measured from entering StandingUp/LowGainTest (NOT tied to the
+  // state), so it also covers the handover to ActiveRL/PC. It should be at
+  // least standup_duration_s + standup_settle_s + standup_handover_s.
+  double standup_grace_s{6.5};
   // Command smoothing (0 = disabled)
   double command_smoothing_alpha{0.0};
   // WaitFeedback overall timeout (0 = no timeout)
@@ -213,6 +266,13 @@ struct ImuSample
   std::array<double, 3> projected_gravity{0.0, 0.0, -1.0};
   bool valid{false};
   double last_update_s{0.0};
+  // In-band monotonic receipt stamps from the bridge (t=, gyro_t=, quat_t=).
+  // -1 means the source file did not provide that stamp (legacy bridge).
+  double source_stamp_s{-1.0};
+  double gyro_stamp_s{-1.0};
+  double quat_stamp_s{-1.0};
+  std::uint64_t gyro_seq{0};
+  std::uint64_t quat_seq{0};
 };
 
 inline std::array<JointMap, kNumJoints> defaultJointMap()

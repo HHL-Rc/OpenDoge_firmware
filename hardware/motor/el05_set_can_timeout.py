@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """el05_set_can_timeout.py — 读写 EL05 的 CAN 超时保护参数 (0x7028 canTimeout)。
 
+现状：暂时不做使用，如果执行bash scripts/start_robot.sh没有成功失能，
+可以再执行一次然后ctrl+C效果是一样的
+
 背景：deploy 正常退出时会发 COMM_STOP 失能电机；但如果某个电机的 CAN
 链路正在丢包（例如 RL_calf/9 号），3 次 COMM_STOP 可能全部丢失，电机就会
 一直保持最后的阻尼指令。把 canTimeout 设为非 0 后，电机在一段时间内收不到

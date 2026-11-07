@@ -16,7 +16,7 @@ ExecStartPre=/bin/sh -c 'for i in $$(seq 1 60); do [ -e /dev/input/js0 ] && exit
 ExecStart=/usr/bin/python3 /home/orangepi/Opendoge/OpenDoge_firmware/hardware/gamepad/xbox_command_bridge.py \
     --output /tmp/opendoge_command.state \
     --profile auto \
-    --max-vx 0.40 --max-vy 0.30 --max-yaw-rate 0.60
+    --max-vx 0.50 --max-vy 0.40 --max-yaw-rate 0.70
 # Always restart — bridge has its own reconnection logic for js0 loss,
 # but a hard crash (e.g. Python interpreter abort) still needs systemd.
 Restart=always

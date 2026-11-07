@@ -11,9 +11,21 @@ wz=...
 gx=...
 gy=...
 gz=...
+t=...          # 最近一帧的单调收包时间 (CLOCK_MONOTONIC)
+gyro_t=...     # gyro 帧的收包时间
+gyro_seq=...   # gyro 帧计数（只在真实新帧时 +1）
+quat_t=...     # quaternion 帧的收包时间
+quat_seq=...   # quaternion 帧计数
 ```
 
 The bridge uses gyroscope data for `w*` and quaternion attitude for projected gravity `g*`.
+
+`t/gyro_t/quat_t/seq` 是给 deploy 做**样本年龄/冻结检测**用的：bridge 现在
+在收到新的 gyro/quat 帧时立即更新文件，但**写文件上限 2 ms（500 Hz）**；
+DM-IMU-L1 实测 gyro/quat 各约 1 kHz，逐帧写（约 2 kHz 的
+`atomic_write`+rename）会让 bridge 自身产生 40–130 ms 的年龄尖峰。deploy
+用 `now - t` 得到年龄，用 `seq` 是否变化判断对应分量是否还在更新。旧的
+消费脚本可以忽略这些行。
 
 ## Permissions (udev)
 
@@ -131,8 +143,8 @@ watch -n 0.1 cat /tmp/opendoge_imu.state
 --gyro-lowpass-hz 50     # 0=关闭（默认）；40-60 Hz 常用
 ```
 
-- 一阶 IIR，按 200 Hz 写文件速率计算；相位滞后约 `1/(2πf)`：
-  50 Hz ≈ 3 ms，40 Hz ≈ 4 ms；
+- 一阶 IIR，按**实际写文件间隔**（≤2 ms 上限）计算，不再假设固定 200 Hz；
+  相位滞后约 `1/(2πf)`：50 Hz ≈ 3 ms，40 Hz ≈ 4 ms；
 - 只影响 `wx/wy/wz`，`projected_gravity` 仍来自姿态四元数（本身已平滑）；
 - **不要**用 `--gyro-scale` 之类把角速度整体缩小来“降低敏感度”：
   那会改变策略的速度反馈，通常会让振荡更糟；

@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include <linux/can.h>
+#include <linux/can/error.h>
 #include <linux/can/raw.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
@@ -34,6 +35,38 @@ constexpr std::uint16_t kIndexFaultStatus = 0x3022;
 // without COMM_SAVE_PARAM (0x16).
 constexpr std::uint16_t kIndexCanTimeout = 0x7028;
 constexpr std::uint8_t kRunModeMotion = 0x00;
+
+std::size_t busIndex(const std::string & name)
+{
+  if (name.size() == 4 && name.rfind("can", 0) == 0 &&
+      name[3] >= '0' && name[3] <= '3') {
+    return static_cast<std::size_t>(name[3] - '0');
+  }
+  return 0;
+}
+
+void parseCanError(std::uint32_t can_id, const can_frame & frame, BusCanStats & bus)
+{
+  ++bus.error_frames;
+  const auto crtl = frame.data[1];
+  if (can_id & CAN_ERR_BUSOFF) {
+    ++bus.bus_off;
+    bus.state = "BUS-OFF";
+  }
+  if (can_id & CAN_ERR_RESTARTED) {
+    ++bus.restarts;
+    bus.state = "ERROR-ACTIVE";
+  }
+  if (can_id & CAN_ERR_CRTL) {
+    if (crtl & (CAN_ERR_CRTL_RX_PASSIVE | CAN_ERR_CRTL_TX_PASSIVE)) {
+      bus.state = "ERROR-PASSIVE";
+    } else if (crtl & (CAN_ERR_CRTL_RX_WARNING | CAN_ERR_CRTL_TX_WARNING)) {
+      bus.state = "ERROR-WARNING";
+    } else if (crtl & CAN_ERR_CRTL_ACTIVE) {
+      bus.state = "ERROR-ACTIVE";
+    }
+  }
+}
 
 // EL05 type-17 read replies carry the value as a little-endian IEEE-754 float
 // in data[4:8].
@@ -135,7 +168,17 @@ bool El05SocketCan::openBus(const std::string & name)
     return false;
   }
 
-  buses_[name] = Bus{name, fd};
+  // Ask the kernel to deliver CAN error frames (the default mask is not
+  // guaranteed to include them). Failure is non-fatal: hw without error
+  // reporting still works, just without CAN_ERR telemetry.
+  const can_err_mask_t err_mask = CAN_ERR_MASK;
+  (void)::setsockopt(fd, SOL_CAN_RAW, CAN_RAW_ERR_FILTER, &err_mask, sizeof(err_mask));
+
+  const auto index = busIndex(name);
+  buses_[name] = Bus{name, fd, index};
+  // Assume ERROR-ACTIVE on a successfully opened bus; CAN_ERR_* frames update
+  // this if the controller goes warning/passive/bus-off.
+  stats_.buses[index].state = "ERROR-ACTIVE";
   return true;
 }
 
@@ -245,7 +288,15 @@ bool El05SocketCan::sendMotion(const JointMap & joint, const MotorCommand & comm
     static_cast<std::uint8_t>((kd_u >> 8) & 0xFF),
     static_cast<std::uint8_t>(kd_u & 0xFF)};
 
-  return sendFrame(joint.can, kCommControl, static_cast<std::uint8_t>(joint.motor_id), data, tau_u);
+  const bool sent = sendFrame(
+    joint.can, kCommControl, static_cast<std::uint8_t>(joint.motor_id), data, tau_u);
+  if (sent) {
+    const auto it = motor_to_index_.find(joint.motor_id);
+    if (it != motor_to_index_.end()) {
+      ++stats_.expected_status[it->second];
+    }
+  }
+  return sent;
 }
 
 bool El05SocketCan::sendFrame(
@@ -262,19 +313,31 @@ bool El05SocketCan::sendFrame(
   frame.can_id = buildExtId(comm_type, data2, motor_id) | CAN_EFF_FLAG;
   frame.can_dlc = 8;
   std::copy(data.begin(), data.end(), frame.data);
+  auto & bus_stats = stats_.buses[it->second.index];
   const auto n = ::write(it->second.fd, &frame, sizeof(frame));
   if (n != static_cast<ssize_t>(sizeof(frame))) {
+    const int write_errno = errno;
+    if (write_errno == EAGAIN || write_errno == EWOULDBLOCK || write_errno == ENOBUFS) {
+      // Transient TX-queue full: drop this frame; the next control tick resends
+      // the same target. Do not latch ok_ or fault the whole robot.
+      ++stats_.tx_queue_full;
+      ++bus_stats.tx_queue_full;
+      return true;
+    }
     ++stats_.write_errors;
-    fail("write(" + can + "): " + std::strerror(errno));
+    ++bus_stats.write_errors;
+    fail("write(" + can + "): " + std::strerror(write_errno));
     return false;
   }
   ++stats_.frames_sent;
+  ++bus_stats.tx;
   return true;
 }
 
 void El05SocketCan::drain(std::array<MotorState, kNumJoints> & states, double now_s)
 {
   for (auto & [_, bus] : buses_) {
+    auto & bus_stats = stats_.buses[bus.index];
     while (true) {
       can_frame frame{};
       const auto n = ::read(bus.fd, &frame, sizeof(frame));
@@ -283,15 +346,24 @@ void El05SocketCan::drain(std::array<MotorState, kNumJoints> & states, double no
           break;
         }
         ++stats_.read_errors;
+        ++bus_stats.read_errors;
         fail("read(" + bus.name + "): " + std::strerror(errno));
         break;
       }
-      if (n != static_cast<ssize_t>(sizeof(frame)) || !(frame.can_id & CAN_EFF_FLAG)) {
+      if (n != static_cast<ssize_t>(sizeof(frame))) {
+        continue;
+      }
+      if (frame.can_id & CAN_ERR_FLAG) {
+        parseCanError(frame.can_id, frame, bus_stats);
+        continue;
+      }
+      if (!(frame.can_id & CAN_EFF_FLAG)) {
         continue;
       }
       std::array<std::uint8_t, 8> data{};
       std::copy(frame.data, frame.data + std::min<std::size_t>(frame.can_dlc, 8), data.begin());
       ++stats_.frames_received;
+      ++bus_stats.rx;
       parseFrame(frame.can_id & kCanEffMask, data, states, now_s);
     }
   }
@@ -311,6 +383,7 @@ void El05SocketCan::parseFrame(
 
   auto & state = states[it->second];
   if (comm_type == kCommReadParam) {
+    ++state.param_frames;
     const auto index = static_cast<std::uint16_t>(data[0] | (data[1] << 8));
     if (index == kIndexRunMode) {
       state.run_mode = static_cast<int>(std::lround(
@@ -321,12 +394,14 @@ void El05SocketCan::parseFrame(
       state.position = static_cast<double>(floatFromLittleEndian(data, 4));
       state.received = true;
       state.last_feedback_s = now_s;
+      state.last_position_s = now_s;
       return;
     }
     if (index == kIndexMechVel) {
       state.velocity = static_cast<double>(floatFromLittleEndian(data, 4));
       state.received = true;
       state.last_feedback_s = now_s;
+      state.last_velocity_s = now_s;
       return;
     }
     if (index == kIndexFaultStatus) {
@@ -363,6 +438,15 @@ void El05SocketCan::parseFrame(
   state.temperature = static_cast<double>(tmp_u) * 0.1;
   state.fault = static_cast<std::uint16_t>((data2 >> 8) & kStatusFaultMask);
   state.mode = static_cast<std::uint8_t>((data2 >> 14) & 0x03);
+  if (state.last_status_s > 0.0) {
+    const double gap = now_s - state.last_status_s;
+    state.last_gap_s = gap;
+    state.max_gap_s = std::max(state.max_gap_s, gap);
+  }
+  state.last_position_s = now_s;
+  state.last_velocity_s = now_s;
+  state.last_status_s = now_s;
+  ++state.status_frames;
   state.received = true;
   state.last_feedback_s = now_s;
 }

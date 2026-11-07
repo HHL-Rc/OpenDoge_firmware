@@ -64,6 +64,8 @@ void updateTargets(
   const std::array<double, kNumJoints> & default_pos,
   const std::array<JointCalibration, kNumJoints> & calib,
   const DeployConfig & config,
-  RuntimeState runtime_state);
+  RuntimeState runtime_state,
+  double t,
+  double standup_handover_start_s);
 
 }  // namespace opendoge

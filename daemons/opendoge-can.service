@@ -14,7 +14,7 @@ RemainAfterExit=yes
 #   CAN_MODULE=<kernel module>                      (e.g. a vendor USB-CAN module)
 EnvironmentFile=-/etc/default/opendoge-can
 # USB enumeration of 4-channel adapters can take longer than 15 s.
-TimeoutStartSec=90
+TimeoutStartSec=180
 
 # Load kernel modules (best effort). A vendor module can be set in
 # /etc/default/opendoge-can via CAN_MODULE=...
@@ -44,20 +44,10 @@ exit 1'
 # Bring up all 4 CAN interfaces as classic CAN at 1 Mbps.
 # EL05 uses classic frames: fd must stay off.
 # CAN_EXPECT_DRIVER: gs_usb (default), a vendor driver name, or "auto"
-# (only warn). This keeps the service working with CHIWU or any other
-# native SocketCAN adapter while still catching a wrong driver by default.
-ExecStart=/bin/sh -c 'expected="$${CAN_EXPECT_DRIVER:-gs_usb}"; \
-for iface in can0 can1 can2 can3; do \
-    drv=$$(basename $$(readlink -f /sys/class/net/$${iface}/device/driver 2>/dev/null) 2>/dev/null); \
-    if [ "$${expected}" != "auto" ] && [ -n "$${expected}" ] && [ "$${drv}" != "$${expected}" ]; then \
-        echo "$${iface}: expected driver $${expected}, got $${drv:-none}" >&2; \
-        exit 1; \
-    fi; \
-    ip link set $${iface} down 2>/dev/null || true; \
-    ip link set $${iface} type can bitrate 1000000 fd off loopback off || exit 1; \
-    ip link set up $${iface} || exit 1; \
-    echo "$${iface} up: classic CAN 1000000 bps, driver=$${drv:-unknown}"; \
-done'
+# (only warn). The script retries with a gs_usb USB authorized reset if
+# `ip link set up` fails, e.g. after the CHIWU board was power-cycled:
+#   gs_usb ... can0: Couldn't start device (err=-110)
+ExecStart=__REPO_ROOT__/scripts/setup_can_interfaces.sh
 
 # Keep interfaces up on restart (avoid flap)
 ExecStop=/bin/true

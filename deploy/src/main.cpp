@@ -408,7 +408,9 @@ int main(int argc, char ** argv)
   bool rl_fallback_active{false};
   double feedback_wait_start_s{0.0};
   double standup_start_s{0.0};
+  double standup_handover_start_s{-1.0};
   int imu_invalid_count{0};
+  int imu_stale_count{0};
   std::array<opendoge::JointSafetyState, opendoge::kNumJoints> safety_state{};
   std::uint64_t last_can_sent = 0;
   std::uint64_t last_can_received = 0;
@@ -425,6 +427,22 @@ int main(int argc, char ** argv)
       if (!can.ok()) {
         fault_reason = can.lastError();
         runtime_state = opendoge::RuntimeState::DampingFault;
+      }
+      // CAN controller error state. BUS-OFF always faults; ERROR-PASSIVE is
+      // configurable (default warn, visible in the status JSON).
+      const auto & can_stats = can.stats();
+      for (std::size_t b = 0; b < can_stats.buses.size(); ++b) {
+        const auto & bus = can_stats.buses[b];
+        if (bus.state == "BUS-OFF") {
+          fault_reason = "CAN BUS-OFF on can" + std::to_string(b);
+          runtime_state = opendoge::RuntimeState::DampingFault;
+          break;
+        }
+        if (config.can_error_action == "fault" && bus.state == "ERROR-PASSIVE") {
+          fault_reason = "CAN ERROR-PASSIVE on can" + std::to_string(b);
+          runtime_state = opendoge::RuntimeState::DampingFault;
+          break;
+        }
       }
     }
 
@@ -567,6 +585,20 @@ int main(int argc, char ** argv)
       if (!opt.allow_missing_imu && imu_invalid_count > config.imu_debounce_count) {
         runtime_state = opendoge::RuntimeState::Ready;
       }
+      // IMU age from the bridge's in-band stamp. A frozen bridge that keeps
+      // rewriting its cached sample still shows a growing age here.
+      const double imu_age_s = (imu.valid && imu.source_stamp_s > 0.0)
+        ? (t > imu.source_stamp_s ? t - imu.source_stamp_s : 0.0) : -1.0;
+      if (config.imu_timeout_s > 0.0 && imu_age_s > config.imu_timeout_s) {
+        ++imu_stale_count;
+      } else {
+        imu_stale_count = 0;
+      }
+      if (config.imu_timeout_s > 0.0 && config.imu_stale_action == "fault" &&
+          imu_stale_count > config.imu_debounce_count) {
+        fault_reason = "IMU stale: age=" + std::to_string(imu_age_s) + "s";
+        runtime_state = opendoge::RuntimeState::DampingFault;
+      }
       next_input_s = t + 0.005;
     }
 
@@ -628,6 +660,7 @@ int main(int argc, char ** argv)
       // Start the ramp from the measured pose. Without this the rate limiter
       // would ramp from the pre-initialised default pose (a step).
       standup_start_s = t;
+      standup_handover_start_s = -1.0;
       bool outside_limits = false;
       for (std::size_t i = 0; i < opendoge::kNumJoints; ++i) {
         const double q = opendoge::logicalPosition(states[i].position, config.joints[i]);
@@ -646,11 +679,83 @@ int main(int argc, char ** argv)
       (void)outside_limits;  // DampingFault is set; the damping branch ignores limited_target
     }
 
+    // Record the Stand-up → policy/PC handover so updateTargets() can blend
+    // the first policy action in instead of stepping the target.
+    const bool left_standup =
+      prev_runtime_state == opendoge::RuntimeState::StandingUp &&
+      (runtime_state == opendoge::RuntimeState::ActiveRL ||
+       runtime_state == opendoge::RuntimeState::ActivePC);
+    if (left_standup) {
+      standup_handover_start_s = t;
+    }
+
+    // Observation-side feedback staleness: a type-2 status path can die while
+    // a type-17 retry keeps q/dq fresh. Default hold keeps the old behaviour;
+    // freeze skips inference; fault enters DampingFault.
+    bool feedback_stale = false;
+    if (config.feedback_hold_max_s > 0.0 &&
+        (runtime_state == opendoge::RuntimeState::ActiveRL ||
+         runtime_state == opendoge::RuntimeState::ActivePC ||
+         runtime_state == opendoge::RuntimeState::EnteringPosition)) {
+      for (std::size_t i = 0; i < opendoge::kNumJoints; ++i) {
+        // No type-2 frame yet at all: let the missing-feedback/state-timeout
+        // safety handle it, not this observation-side check.
+        const double status_age =
+          (states[i].status_frames > 0 && states[i].last_status_s > 0.0)
+          ? t - states[i].last_status_s : 0.0;
+        if (status_age > config.feedback_hold_max_s) {
+          feedback_stale = true;
+          break;
+        }
+      }
+      if (feedback_stale && config.stale_action == "fault") {
+        fault_reason = "motor feedback stale > " +
+          std::to_string(config.feedback_hold_max_s) + "s";
+        runtime_state = opendoge::RuntimeState::DampingFault;
+      }
+    }
+
     // ── Inference block (100 Hz) ──
     if (t >= next_infer_s) {
       ++loop_stats.inference_ticks;
       if ((runtime_state == opendoge::RuntimeState::ActiveRL || runtime_state == opendoge::RuntimeState::EnteringPosition
-           || runtime_state == opendoge::RuntimeState::ActivePC) && command.active) {
+           || runtime_state == opendoge::RuntimeState::ActivePC) && command.active &&
+          !(feedback_stale && config.stale_action == "freeze")) {
+        // Refresh observation inputs at the inference tick. The 200 Hz
+        // safety/command poll above is intentionally kept (it bounds file I/O
+        // and preserves the command EMA / IMU debounce rates), but it adds up
+        // to one poll period to the policy observation. Draining CAN and
+        // re-reading the bridge file here removes that phase: the bridge now
+        // writes on new gyro/quat frames instead of every 5 ms, so this sees
+        // the freshest sample. No observation dimension, action_scale,
+        // default pose or control-law change.
+        if (!opt.dry_run) {
+          can.drain(states, t);
+        }
+        if (!opt.imu_file.empty()) {
+          opendoge::ImuSample fresh_imu;
+          std::string imu_refresh_error;
+          if (opendoge::readImuFile(opt.imu_file, fresh_imu, t, imu_refresh_error) &&
+              fresh_imu.valid) {
+            if (config.lin_vel_source == "zero") {
+              fresh_imu.linear_velocity = {0.0, 0.0, 0.0};
+            } else if (config.lin_vel_source == "command") {
+              fresh_imu.linear_velocity = {command.vx, command.vy, 0.0};
+            }
+            imu = fresh_imu;
+          }
+        }
+        double obs_joint_age_s = -1.0;
+        for (const auto & state : states) {
+          if (state.received && state.last_feedback_s > 0.0) {
+            obs_joint_age_s = std::max(
+              obs_joint_age_s, std::max(0.0, t - state.last_feedback_s));
+          }
+        }
+        loop_stats.last_obs_imu_age_s =
+          (imu.valid && imu.source_stamp_s > 0.0)
+            ? std::max(0.0, t - imu.source_stamp_s) : -1.0;
+        loop_stats.last_obs_joint_age_s = obs_joint_age_s;
         obs = opendoge::buildObservation(states, config.joints, default_pos, last_action, command, imu);
         if (!policy->infer(obs, action, error)) {
           if (runtime_state == opendoge::RuntimeState::ActiveRL) {
@@ -673,7 +778,8 @@ int main(int argc, char ** argv)
       ++loop_stats.target_ticks;
       opendoge::updateTargets(
         logical_target, limited_target, last_action, action,
-        default_pos, config.joints, config, runtime_state);
+        default_pos, config.joints, config, runtime_state, t,
+        standup_handover_start_s);
       next_target_s = t + 1.0 / config.target_hz;
     }
 

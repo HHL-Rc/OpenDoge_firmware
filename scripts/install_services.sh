@@ -4,8 +4,27 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICES_DIR="${ROOT_DIR}/daemons"
 
-SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
+# When the installer is run through sudo, $HOME is often /root. The user
+# services must be installed into the invoking user's home and managed via
+# that user's systemd manager (systemctl --user under sudo has no
+# DBUS/XDG_RUNTIME_DIR and fails with "Failed to connect to bus").
+RUN_USER="${SUDO_USER:-$(id -un)}"
+RUN_UID="$(id -u "${RUN_USER}" 2>/dev/null || id -u)"
+RUN_HOME="$(getent passwd "${RUN_USER}" 2>/dev/null | cut -d: -f6 || true)"
+[ -n "${RUN_HOME}" ] || RUN_HOME="${HOME}"
+SYSTEMD_USER_DIR="${RUN_HOME}/.config/systemd/user"
 SYSTEMD_SYSTEM_DIR="/etc/systemd/system"
+
+run_user() {
+    if [ "$(id -u)" -eq 0 ] && [ "${RUN_USER}" != "root" ]; then
+        sudo -u "${RUN_USER}" env \
+            XDG_RUNTIME_DIR="/run/user/${RUN_UID}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${RUN_UID}/bus" \
+            "$@"
+    else
+        "$@"
+    fi
+}
 
 CAN_SERVICE="opendoge-can.service"
 XBOXDRV_SERVICE="opendoge-xboxdrv.service"
@@ -128,6 +147,11 @@ fi
 # ═══════════════════════════════════════════════════════════════════
 # Step 4: IMU bridge (user service)
 # ═══════════════════════════════════════════════════════════════════
+# Make sure the invoking user's systemd manager/runtime dir exists before
+# using `systemctl --user` (sudo alone has no DBUS/XDG_RUNTIME_DIR).
+if command -v loginctl &>/dev/null; then
+    loginctl enable-linger "${RUN_USER}" 2>/dev/null || true
+fi
 echo ""
 echo "[4/5] Installing DM-IMU-L1 bridge (user service) ..."
 # IMU 串口默认是 root:dialout 0660；user service 打不开，需要 udev 规则。
@@ -138,36 +162,46 @@ if [[ -f "${ROOT_DIR}/hardware/imu/99-opendoge-imu.rules" ]]; then
     echo "      Installed IMU udev rule → /etc/udev/rules.d/99-opendoge-imu.rules"
     echo "      (if permission still denied, unplug/replug the IMU or reboot)"
 fi
-mkdir -p "${SYSTEMD_USER_DIR}"
+run_user install -d -m 0755 "${SYSTEMD_USER_DIR}"
 # 服务模板里写死了 /home/orangepi/Opendoge/OpenDoge_firmware，
 # 安装时替换为当前仓库实际路径（Ubuntu 24.04 默认用户通常不是 orangepi）。
-sed "s|/home/orangepi/Opendoge/OpenDoge_firmware|${ROOT_DIR}|g" \
-    "${SERVICES_DIR}/${IMU_SERVICE}" > "${SYSTEMD_USER_DIR}/${IMU_SERVICE}"
-systemctl --user daemon-reload
-systemctl --user enable "${IMU_SERVICE}"
+tmp_unit="$(mktemp)"
+chmod 0644 "${tmp_unit}"
+sed -e "s|/home/orangepi/Opendoge/OpenDoge_firmware|${ROOT_DIR}|g" \
+    -e "s|__REPO_ROOT__|${ROOT_DIR}|g" \
+    "${SERVICES_DIR}/${IMU_SERVICE}" > "${tmp_unit}"
+run_user install -m 0644 "${tmp_unit}" "${SYSTEMD_USER_DIR}/${IMU_SERVICE}"
+rm -f "${tmp_unit}"
+run_user systemctl --user daemon-reload
+run_user systemctl --user enable "${IMU_SERVICE}"
 echo "      Installed → ${SYSTEMD_USER_DIR}/${IMU_SERVICE}"
 echo "      Starting ..."
-systemctl --user restart "${IMU_SERVICE}" || echo "      [WARN] IMU bridge failed to start (IMU not plugged in?)"
+run_user systemctl --user restart "${IMU_SERVICE}" || echo "      [WARN] IMU bridge failed to start (IMU not plugged in?)"
 
 # ═══════════════════════════════════════════════════════════════════
 # Step 5: Joystick bridge (user service)
 # ═══════════════════════════════════════════════════════════════════
 echo ""
 echo "[5/5] Installing joystick bridge (user service) ..."
-sed "s|/home/orangepi/Opendoge/OpenDoge_firmware|${ROOT_DIR}|g" \
-    "${SERVICES_DIR}/${JOYSTICK_SERVICE}" > "${SYSTEMD_USER_DIR}/${JOYSTICK_SERVICE}"
-systemctl --user daemon-reload
-systemctl --user enable "${JOYSTICK_SERVICE}"
-systemctl --user restart "${JOYSTICK_SERVICE}" || echo "      [WARN] joystick bridge failed to start (no js0?)"
+tmp_unit="$(mktemp)"
+chmod 0644 "${tmp_unit}"
+sed -e "s|/home/orangepi/Opendoge/OpenDoge_firmware|${ROOT_DIR}|g" \
+    -e "s|__REPO_ROOT__|${ROOT_DIR}|g" \
+    "${SERVICES_DIR}/${JOYSTICK_SERVICE}" > "${tmp_unit}"
+run_user install -m 0644 "${tmp_unit}" "${SYSTEMD_USER_DIR}/${JOYSTICK_SERVICE}"
+rm -f "${tmp_unit}"
+run_user systemctl --user daemon-reload
+run_user systemctl --user enable "${JOYSTICK_SERVICE}"
+run_user systemctl --user restart "${JOYSTICK_SERVICE}" || echo "      [WARN] joystick bridge failed to start (no js0?)"
 echo "      Installed → ${SYSTEMD_USER_DIR}/${JOYSTICK_SERVICE}"
 
 # ═══════════════════════════════════════════════════════════════════
 # Enable lingering so user services start at boot
 # ═══════════════════════════════════════════════════════════════════
 if command -v loginctl &>/dev/null; then
-    loginctl enable-linger "$(whoami)" 2>/dev/null || true
+    loginctl enable-linger "${RUN_USER}" 2>/dev/null || true
     echo ""
-    echo "      Lingering enabled for $(whoami)"
+    echo "      Lingering enabled for ${RUN_USER}"
 fi
 
 # ═══════════════════════════════════════════════════════════════════

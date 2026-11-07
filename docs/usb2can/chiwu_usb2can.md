@@ -106,6 +106,12 @@ sudo bash scripts/setup_can.sh can3 1000000
 - 校验驱动（`CAN_EXPECT_DRIVER`，默认 `gs_usb`；`auto` 只警告）；
 - 设置 1 Mbps、fd off、loopback off、UP。
 
+`ExecStart` 由 `scripts/setup_can_interfaces.sh` 执行：如果 `ip link set up`
+失败（例如 CHIWU 被电机断电一起复位，内核报
+`gs_usb ... Couldn't start device (err=-110)`），它会先对 4 个 `1d50:606f`
+做 USB `authorized 0/1` 复位、重新 `prepare_can_interfaces.sh`，再重试
+（`CAN_SETUP_ATTEMPTS`，默认 3）。如果整块板子没 24V，重试也救不了，会明确失败。
+
 ## 5. 验证
 
 ```bash
@@ -137,4 +143,6 @@ bash scripts/start_robot.sh damping           # 先悬挂/支撑
 | 出现 CAN FD | 必须 `fd off`；EL05 只支持经典 CAN |
 | 某个通道无回包 | CANH/CANL、120 Ω 终端（只在两端）、共地、电机供电 |
 | USB 反复 disconnect | USB 线/供电；Hub 必须外部供电；看 `journalctl -k` |
+| `ip link set canX up` 报 `RTNETLINK ... Connection timed out`，内核 `gs_usb ... Couldn't start device (err=-110)` | CHIWU 板被复位/24V 未上：恢复板子供电，`sudo scripts/reset_can_usb.sh`；仍失败就彻底拔 USB/断电 5–10 s |
+| 给电机断电后 can0-3 掉线 | CHIWU 的 24V 很可能和电机共开关；让板子单独常供，或断电后 `sudo scripts/reset_can_usb.sh` 再启动 |
 | 旧 vcan 还在 | `sudo systemctl disable --now opendoge-vcan opendoge-usb2can0 opendoge-usb2can1`，删除 vcan 接口 |

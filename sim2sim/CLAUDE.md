@@ -672,7 +672,7 @@ C++ 新增 `--lin-vel-source {zero,command,imu}` / `lin_vel_source` 配置项。
 | 风险 | 说明 |
 |------|------|
 | Calf 力矩上限 | LainLab 训练 effort limit 9 N·m，EL05 只有 6 N·m。策略若长时间饱和在小腿会被限幅 |
-| 关节限位 | 固件 XML 的物理限位比训练 XML 窄；配置中保留硬件限位，超出时会被 `clamp`，策略行为可能与仿真不同 |
+| 关节限位 | 2026-11-06（修改 54）已把固件 XML/deploy 限位对齐训练值，并保留实机手掰余量（RL/RR thigh 下限 −0.85）；仍需实机验证放宽后的姿态不会自碰撞 |
 | 质量分布 | 固件 XML 与训练 XML 的 base 惯量/质心尚未逐项核对 |
 | IMU 线速度 | `dm_imu_bridge.py` 目前不输出 `vx/vy/vz`，`imu` 模式实际等价于 `zero` |
 | 摩擦锥 | 训练 `cone=elliptic impratio=100`，固件 XML 已对齐 |
@@ -703,3 +703,50 @@ C++ 新增 `--lin-vel-source {zero,command,imu}` / `lin_vel_source` 配置项。
 
 **注意**: 之前基于旧 sim2sim 做的所有“策略在仿真里正常”的结论，
 在 pitch/roll 相关项上是用镜像后的重力得到的；修复后需重新评估。
+
+---
+
+## Round 6: 起身交接稳定段与目标淡入 (2026-11-06，修改 55)
+
+### 背景
+
+真机装电池后，起身斜坡结束、交接给策略的瞬间，第一帧策略动作可能很大
+（`raw × 0.25`，raw 可达 ±3）；`ActiveRL` 原本 `limited_target = logical_target`
+瞬时到位，calf 目标会跳变 0.5–0.9 rad，产生“噔”一下和 gz 尖峰，触发 IMU
+倒地检测误报。
+
+### 修改（C++ 与 sim2sim 同步）
+
+- `StandingUp` 斜坡到默认姿态后再保持 `standup_settle_s`（默认 1 s）才交接；
+- 交接后 `standup_handover_s`（默认 1 s）内，目标从默认姿态按 alpha 淡入策略
+  动作，并在这段时间保留 rate limiter（正常 `ActiveRL` 仍不 rate limit）；
+- 倒地检测的 `standup_grace_s` 改为**时间窗**（从进入起立开始计，默认 6.5 s），
+  不再绑定当前状态，覆盖“斜坡 + 稳定 + 交接”；
+- `sim2sim/deploy_mujoco.py` 的 `DeployConfig`、`StandingUp` 状态机、目标块同步了
+  `standup_settle_s`、`standup_handover_s` 和淡入逻辑；回归测试新增交接淡入检查
+  （59 passed）。
+- 仿真验证：`--mode rl --policy policy/opendoge_flat.onnx --duration 9
+  --max-deviation 0.25` 从趴伏起身，5.002 s 交接，calf target 在交接窗口内
+  平滑变化（max |Δ|/row ≈ 0.0006），无瞬跳。
+
+### 注意
+
+这是一次性偏离训练契约（只在交接窗口内），之后 `ActiveRL` 仍按训练的无
+rate limit 瞬时目标运行。实机重点验证：交接瞬间 `target` 是否连续、calf
+是否不再弹、`fall detected` 是否消失。
+
+---
+
+## Round 7: 观测延迟/丢包注入 (2026-11-06，修改 58)
+
+- `--imu-delay-ms` / `--joint-delay-ms`：只在 `build_observation` 的采样点使用
+  历史 ring buffer；PD/plant 仍用当前状态。0 时完全走原路径（零延迟等价）。
+- `--packet-loss` + `--loss-burst-ms` + `--loss-target {joint,bus,all}`：在
+  200 Hz target tick 更新 hold 状态；丢包时观测保持上一帧 q/dq。
+- `--cmd-loss`：在 target tick 决定，控制块保持上一 `limited_target`，模拟电机
+  保持上一条 CAN 命令。
+- 延迟分辨率 = `model.opt.timestep`；固件 XML 默认 0.002，LainLab XML 是 0.01
+  （5/10 ms 不可表示）。扫 5/10 ms 时需要更小 timestep 或接受量化。
+- 验证：`--mode idle`、`--mode rl --max-deviation 0.25 --imu-delay-ms 10
+  --joint-delay-ms 5`、`--packet-loss 0.05 --loss-burst-ms 20 --cmd-loss 0.02`
+  均可起身到 ActiveRL，无崩溃。

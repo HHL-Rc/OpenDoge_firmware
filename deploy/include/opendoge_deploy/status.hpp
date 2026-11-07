@@ -16,6 +16,11 @@ struct LoopStats
   std::uint64_t target_ticks{0};
   std::uint64_t missed_control_deadlines{0};
   double max_control_late_s{0.0};
+  // Ages of the freshest IMU/joint samples used by the last policy
+  // observation (after the pre-inference refresh). Last-value diagnostics,
+  // not per-window counters: resetWindow() deliberately does not clear them.
+  double last_obs_imu_age_s{-1.0};
+  double last_obs_joint_age_s{-1.0};
 
   void resetWindow()
   {

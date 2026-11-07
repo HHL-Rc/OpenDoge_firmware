@@ -91,6 +91,28 @@ bool getBool(
   return parseBool(it->second);
 }
 
+std::uint64_t getUint64(
+  const std::unordered_map<std::string, std::string> & values, const std::string & key,
+  std::uint64_t fallback)
+{
+  const auto it = values.find(key);
+  if (it == values.end() || it->second.empty()) {
+    return fallback;
+  }
+  return static_cast<std::uint64_t>(std::stoull(it->second));
+}
+
+std::string getString(
+  const std::unordered_map<std::string, std::string> & values, const std::string & key,
+  const std::string & fallback)
+{
+  const auto it = values.find(key);
+  if (it == values.end() || it->second.empty()) {
+    return fallback;
+  }
+  return it->second;
+}
+
 std::vector<double> parseNumbers(const std::string & text)
 {
   std::string normalized = text;
@@ -146,6 +168,10 @@ bool loadDeployConfig(
       values, "standup_max_position_step", config.standup_max_position_step);
     config.standup_duration_s = getDouble(
       values, "standup_duration_s", config.standup_duration_s);
+    config.standup_settle_s = getDouble(
+      values, "standup_settle_s", config.standup_settle_s);
+    config.standup_handover_s = getDouble(
+      values, "standup_handover_s", config.standup_handover_s);
     config.standup_tracking_error_threshold = getDouble(
       values, "standup_tracking_error_threshold", config.standup_tracking_error_threshold);
     config.standup_tracking_error_timeout_s = getDouble(
@@ -170,6 +196,25 @@ bool loadDeployConfig(
     config.fall_gravity_z_threshold = getDouble(values, "fall_gravity_z_threshold", config.fall_gravity_z_threshold);
     config.fall_timeout_s = getDouble(values, "fall_timeout_s", config.fall_timeout_s);
     config.standup_grace_s = getDouble(values, "standup_grace_s", config.standup_grace_s);
+    config.imu_timeout_s = getDouble(values, "imu_timeout_s", config.imu_timeout_s);
+    config.imu_stale_action = getString(values, "imu_stale_action", config.imu_stale_action);
+    config.feedback_hold_max_s = getDouble(
+      values, "feedback_hold_max_s", config.feedback_hold_max_s);
+    config.stale_action = getString(values, "stale_action", config.stale_action);
+    config.can_error_action = getString(values, "can_error_action", config.can_error_action);
+    if (config.imu_stale_action != "warn" && config.imu_stale_action != "fault") {
+      error = "imu_stale_action must be warn|fault";
+      return false;
+    }
+    if (config.stale_action != "hold" && config.stale_action != "freeze" &&
+        config.stale_action != "fault") {
+      error = "stale_action must be hold|freeze|fault";
+      return false;
+    }
+    if (config.can_error_action != "warn" && config.can_error_action != "fault") {
+      error = "can_error_action must be warn|fault";
+      return false;
+    }
     config.command_smoothing_alpha = getDouble(values, "command_smoothing_alpha", config.command_smoothing_alpha);
     config.feedback_wait_timeout_s = getDouble(values, "feedback_wait_timeout_s", config.feedback_wait_timeout_s);
     config.temp_warn_c = getDouble(values, "temp_warn_c", config.temp_warn_c);
@@ -334,8 +379,16 @@ bool readImuFile(const std::string & path, ImuSample & imu, double now_s, std::s
       getDouble(values, "vx", imu.linear_velocity[0]),
       getDouble(values, "vy", imu.linear_velocity[1]),
       getDouble(values, "vz", imu.linear_velocity[2])};
+    // In-band monotonic receipt stamps from the bridge. If the bridge is old
+    // (no t=), fall back to the deploy's read time; the bridge's cached-write
+    // behaviour means mtime alone cannot detect a frozen sensor.
+    imu.source_stamp_s = getDouble(values, "t", -1.0);
+    imu.gyro_stamp_s = getDouble(values, "gyro_t", -1.0);
+    imu.quat_stamp_s = getDouble(values, "quat_t", -1.0);
+    imu.gyro_seq = getUint64(values, "gyro_seq", 0);
+    imu.quat_seq = getUint64(values, "quat_seq", 0);
     imu.valid = true;
-    imu.last_update_s = now_s;
+    imu.last_update_s = imu.source_stamp_s > 0.0 ? imu.source_stamp_s : now_s;
   } catch (const std::exception & exc) {
     error = "bad imu file " + path + ": " + exc.what();
     return false;

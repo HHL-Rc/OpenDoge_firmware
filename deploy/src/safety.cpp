@@ -173,12 +173,14 @@ bool safetyFault(
   // ── IMU-based fall detection ──
   static double fall_since_s = 0.0;
   static double fall_imu_invalid_since_s = 0.0;
-  // Supervised stand-up: LowGainTest starts from the measured (often prone)
-  // pose, so projected_gravity.z ≈ 0 would trip the fall check immediately.
-  // Suppress it for standup_grace_s after entering LowGainTest, then re-arm.
+  // Supervised stand-up: the robot starts from the measured (often prone) pose,
+  // so projected_gravity.z ≈ 0 would trip the fall check immediately. This is
+  // a TIME WINDOW from entering StandingUp/LowGainTest, not tied to the current
+  // state, so it also covers the Stand-up → ActiveRL/PC handover. The old
+  // state-tied version re-armed exactly at the handover, so a stand-up jerk
+  // (calf snap) could trip the fall check.
   const bool standup_grace =
-    (runtime_state == RuntimeState::LowGainTest ||
-     runtime_state == RuntimeState::StandingUp) &&
+    standup_start_s > 0.0 &&
     now_s - standup_start_s < config.standup_grace_s;
   // Fall detection only matters while the controller is actively driving the
   // joints. In Ready / DampingFault the motors are only damping, so a tilted

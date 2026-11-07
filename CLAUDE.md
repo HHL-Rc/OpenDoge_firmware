@@ -120,6 +120,7 @@ CAN 接口由 `opendoge-can.service` (system oneshot) 在开机时自动配置�
 sudo systemctl status opendoge-can              # 查看状态
 sudo systemctl restart opendoge-can             # 重新配置 4 个 CAN 口
 sudo journalctl -u opendoge-can -n 20           # 查看最近日志
+sudo scripts/reset_can_usb.sh                   # 电机断电导致 CHIWU 板复位后 (err=-110)
 ```
 
 底层手动命令 (通常不需要，用 systemd 即可)：
@@ -229,7 +230,9 @@ opendoge-imu (auto-detect /dev/ttyUSBx by USB ID 6877:4d55) → /tmp/opendoge_im
 > 直接配置 `can0-can3`。旧的 DINGLAB vcan + bridge 方案已归档到
 > `~/DingLab usb转can代码`（见 `docs/legacy/README.md`），不再安装/运行。
 
-C++ deploy 通过 `runtime_io.cpp` 的 `readImuFile()` / `readCommandFile()` 以 200 Hz 轮询这些文件。这是有意设计：
+C++ deploy 通过 `runtime_io.cpp` 的 `readImuFile()` / `readCommandFile()` 轮询这些文件。
+安全/命令轮询仍是 200 Hz；**策略观测在推理 tick（100 Hz）前会重新 `can.drain` 并
+重读 IMU 文件**，避免观测等待 200 Hz 轮询相位（修改 64）。这是有意设计：
 - 实时循环 (`SCHED_FIFO`) 免于处理串口/HID I/O
 - 守护进程可独立重启
 - dry-run 测试可直接写入文件注入假数据
@@ -386,7 +389,7 @@ sudo ./scripts/setup_vcan.sh can0 can1 can2 can3
 |----------|-----|------------|----------|
 | FL/RL Hip | X (1,0,0) | 外展 (远离中线) | 向外推 |
 | FR/RR Hip | X (1,0,0) | 内收 (靠近中线) | **向内推** |
-| 全部 Thigh | Y (0,1,0) | 屈髋 (膝向前) | 向前推 |
+| 全部 Thigh | Y (0,1,0) | 伸髋 (膝盖向尾部) | **向后推 (膝盖朝尾部)** |
 | 全部 Calf | Y (0,1,0) | 伸膝 (脚远离) | 伸直小腿 |
 
 ⚠️ FR/RR hip 与 FL/RL hip 的 URDF 正方向物理含义相反 (都绕 +X 轴, 右手定则下左右侧对称)。
@@ -396,13 +399,19 @@ sudo ./scripts/setup_vcan.sh can0 can1 can2 can3
 | 关节 | dir | 关节 | dir |
 |------|-----|------|-----|
 | FL_hip | **-1** | FR_hip | **-1** |
-| FL_thigh | +1 | FR_thigh | **-1** |
+| FL_thigh | **-1** | FR_thigh | **+1** |
 | FL_calf | +1 | FR_calf | **-1** |
 | RL_hip | +1 | RR_hip | +1 |
-| RL_thigh | +1 | RR_thigh | **-1** |
+| RL_thigh | **-1** | RR_thigh | **+1** |
 | RL_calf | +1 | RR_calf | **-1** |
 
-规律: Thigh/Calf 左右镜像 (L=+1, R=-1), Hip 前后分 (F=-1, R=+1)。
+规律: Calf 左右镜像 (L=+1, R=-1); Thigh 因 URDF 正方向朝尾部，映射为
+L=-1, R=+1（与 Calf 相反）; Hip 前后分 (F=-1, R=+1)。
+
+> ⚠️ 2026-11-06 修正（修改 54）：Thigh 的 URDF 正方向是“膝盖向尾部”，
+> 旧表写的“屈髋（膝向前）”是错的，导致四条大腿的 direction 反了。
+> `discover_direction.py` 的 thigh 提示已改为“向后推（膝盖往尾部方向）”，
+> 上表已按修正后的约定更新。髋和小腿不受影响。
 
 ### 电机零位标定方案 (2026-06-26)
 

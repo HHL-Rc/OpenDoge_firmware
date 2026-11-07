@@ -148,9 +148,11 @@ void updateStateMachine(
   if (runtime_state == RuntimeState::StandingUp) {
     if (!command.active) {
       runtime_state = RuntimeState::Ready;
-    } else if (t - standup_start_s >= config.standup_duration_s) {
-      // The target ramp has reached the default pose (tracking/torque safety
-      // would have faulted otherwise); hand over to the policy/PC.
+    } else if (t - standup_start_s >=
+               config.standup_duration_s + config.standup_settle_s) {
+      // The target ramp has reached the default pose and the settle window
+      // has elapsed (tracking/torque safety would have faulted otherwise);
+      // hand over to the policy/PC.
       runtime_state = command.rl_inference ? RuntimeState::ActiveRL
                                            : RuntimeState::ActivePC;
     }
@@ -259,8 +261,25 @@ void updateTargets(
   const std::array<double, kNumJoints> & default_pos,
   const std::array<JointCalibration, kNumJoints> & calib,
   const DeployConfig & config,
-  RuntimeState runtime_state)
+  RuntimeState runtime_state,
+  double t,
+  double standup_handover_start_s)
 {
+  // One-shot blend after a supervised stand-up. The first policy action can
+  // be large; without this the ActiveRL branch jumps the target instantly and
+  // the calf can snap (large gz spike that trips the fall check). The blend
+  // starts at the default pose and ramps to the full policy target.
+  const bool handover =
+    (runtime_state == RuntimeState::ActiveRL ||
+     runtime_state == RuntimeState::ActivePC) &&
+    standup_handover_start_s >= 0.0 &&
+    t - standup_handover_start_s < config.standup_handover_s;
+  const double handover_alpha = handover
+    ? std::clamp(
+        (t - standup_handover_start_s) / std::max(config.standup_handover_s, 1.0e-6),
+        0.0, 1.0)
+    : 1.0;
+
   for (std::size_t i = 0; i < kNumJoints; ++i) {
     const auto & joint_cfg = calib[i];
     // LainLab / mjlab JointPositionAction: processed = raw * scale + default,
@@ -276,8 +295,14 @@ void updateTargets(
         default_pos[i] + kJointSign[i] * last_action[i] * config.action_scale;
     }
     logical_target[i] = std::clamp(logical_target[i], joint_cfg.lower, joint_cfg.upper);
-    // RL mode: skip rate_limit (policy trained with instantaneous target changes)
-    if (runtime_state == RuntimeState::ActiveRL) {
+    if (handover) {
+      // Blend from the settled default pose to the policy target and keep the
+      // rate limiter active even in ActiveRL for this one-shot window.
+      const double blended = default_pos[i] + handover_alpha *
+        (logical_target[i] - default_pos[i]);
+      limited_target[i] = rateLimit(blended, limited_target[i], joint_cfg.max_position_step);
+    } else if (runtime_state == RuntimeState::ActiveRL) {
+      // RL mode: skip rate_limit (policy trained with instantaneous target changes)
       limited_target[i] = logical_target[i];
     } else {
       // LowGainTest uses a slower slew so the stand-up from the measured pose

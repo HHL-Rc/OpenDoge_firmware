@@ -8,9 +8,9 @@
 hardware/imu/dm_imu_bridge.py             → /tmp/opendoge_imu.state      → opendoge_deploy 文件轮询
 hardware/gamepad/xbox_command_bridge.py  → /tmp/opendoge_command.state  → opendoge_deploy 文件轮询
 opendoge_deploy (C++, SCHED_FIFO)
-  → ONNX policy 推理 @ 100 Hz (CPU)
+  → ONNX policy 推理 @ 100 Hz (CPU)；推理前重新 drain CAN + 重读 IMU 文件
   → 目标位置计算 @ 200 Hz (PD + rate limit)
-  → EL05 运控帧发送 @ 1000 Hz (q/dq/tau/kp/kd)
+  → EL05 运控帧发送 @ control_hz (q/dq/tau/kp/kd)
   → SocketCAN can0/can1/can2/can3
   → USB-CAN 适配器 (CHIWU 4×CAN, 原生 can0-3) → EL05 电机
 ```
@@ -104,11 +104,13 @@ vz=0.0
 # 控制频率
 inference_hz=100
 target_hz=200
-control_hz=1000
+control_hz=200   # 当前 CHIWU 原生 CAN；旧 USB-CAN bridge 时代是 100
+# 修改 64：观测在推理 tick 前刷新，不再等待 200 Hz 输入轮询相位；
+# 实际观测年龄看 status 的 obs_imu_age_ms / obs_joint_age_ms。
 
 # PD 增益 (LainLab BuiltinPositionActuatorCfg: stiffness=12.0, damping=0.5)
 kp=12.0
-kd=0.5
+kd=0.65          # 2026-11-07 现场调参；训练值 0.5（修改 64 前记录 kd=0.8 的效果）
 safe_kd=2.0
 action_scale=0.25
 
@@ -124,7 +126,13 @@ lin_vel_source=command
 can_timeout_s=1.0
 
 # 安全阈值
-state_timeout_s=0.02
+state_timeout_s=0.1   # 当前 live config；旧文档的 0.02 是更早的保守值
+# 新增可观测/策略（默认 warn/hold/warn，不改变控制行为）
+imu_timeout_s=0.25
+imu_stale_action=warn       # warn|fault
+feedback_hold_max_s=0.03
+stale_action=hold           # hold|freeze|fault
+can_error_action=warn       # warn|fault; BUS-OFF always fault
 over_temperature_c=80.0
 temp_warn_c=65.0
 torque_threshold=3.0
@@ -134,6 +142,10 @@ tracking_error_timeout_s=0.3
 command_timeout_s=0.5
 fall_gravity_z_threshold=0.3
 fall_timeout_s=0.3
+# 起立稳定段 + 交接淡入 + 倒地检测时间窗（覆盖 4 s 斜坡 + 1 s 稳定 + 1 s 交接）
+standup_settle_s=1.0
+standup_handover_s=1.0
+standup_grace_s=6.5
 feedback_wait_timeout_s=5.0
 command_smoothing_alpha=0.0
 
@@ -146,13 +158,29 @@ fault_poll_hz=10.0
 
 # 每关节校准 (实际格式为逐字段 key=value)
 joint.FL_hip_joint.direction=-1
-joint.FL_hip_joint.offset=0.0600
-joint.FL_hip_joint.lower=-0.785
-joint.FL_hip_joint.upper=0.26
+joint.FL_hip_joint.offset=0.0000
+joint.FL_hip_joint.lower=-1.0000
+joint.FL_hip_joint.upper=0.5218
 joint.FL_hip_joint.max_position_step=0.015
 # 可选: reduction (小腿减速比 1.5), max_velocity/max_torque/max_kp/max_kd
+# 注意: 四条 thigh 的 direction 为 L=-1 / R=+1、offset = -direction*0.8
+# (URDF 正方向是膝盖朝尾部；见修改 54)
 # ... 其余 11 关节，完整值见 deploy/configs/opendoge_deploy.conf
 ```
+
+### 诊断字段 (status JSON, 修改 57/59)
+
+- IMU：`imu_age_ms/imu_gyro_age_ms/imu_quat_age_ms/imu_stamp/imu_gyro_seq/imu_quat_seq`
+  （bridge 写带内 `t=/gyro_t=/quat_t=/seq=`；冻结的文件也能看出来）。
+  `obs_imu_age_ms/obs_joint_age_ms` 是**最近一次策略观测**实际使用的 IMU/关节
+  样本年龄（推理前刷新后），用于验证观测延迟是否下降（修改 64）。
+- 每关节：`age_ms`（joint-wide）、`pos_age_ms/vel_age_ms/status_age_ms`、
+  `status_frames/expected/missed/max_gap_ms/last_gap_ms/rx_ratio`。
+- CAN：`can_tx_queue_full`、`can_buses[]`（tx/rx/err/qfull/error_frames/bus_off/state）。
+- `EAGAIN/ENOBUFS` 只计数并在下一 tick 重发，不再直接 DampingFault；
+  `BUS-OFF` 始终 fault，`ERROR-PASSIVE` 按 `can_error_action`。
+- 默认 `imu_stale_action=warn`、`stale_action=hold`、`can_error_action=warn`；
+  需要更激进的行为时显式改成 `fault`/`freeze`。
 
 ### Observation 格式 (48 维, LainLab mjlab actor obs)
 
@@ -218,8 +246,16 @@ WaitFeedback → Ready ↔ EnteringPosition → ActivePC ↔ ActiveRL
                               │
                    Ready + active + 离默认站姿 > pc_startup_max_deviation
                               → StandingUp（斜坡到站姿、不跑策略）
-                              → ActivePC / ActiveRL（standup_duration_s 后）
+                              → 保持默认姿态 standup_settle_s
+                              → ActivePC / ActiveRL（总时长 standup_duration_s + standup_settle_s）
+                              → 交接后 standup_handover_s 内目标从默认姿态淡入策略动作
 ```
+
+**起立/交接注意**：`standup_grace_s` 是从进入 `StandingUp`/`LowGainTest` 开始计的
+**时间窗**，不随状态切换结束，所以覆盖“斜坡 + 稳定段 + 交接淡入”；旧版绑定
+状态，会在切到 ActiveRL 的瞬间恢复倒地检测，末尾 calf 弹一下就可能误报。
+交接后的 `standup_handover_s` 内仍保留 rate limiter（正常 ActiveRL 不 rate limit），
+避免第一帧策略动作把目标瞬跳。
 
 故障触发条件 (进入 `DampingFault`):
 - 电机反馈丢失/超时
@@ -232,6 +268,9 @@ WaitFeedback → Ready ↔ EnteringPosition → ActivePC ↔ ActiveRL
 - IMU 倒地检测 (`projected_gravity.z > -fall_gravity_z_threshold` 持续 > `fall_timeout_s`；
   竖直时 `gz=-1`，倾斜/倒置时趋近 0 或 +1)
 - IMU 持续无效 (> `imu_debounce_count` 帧)
+- IMU stale（`imu_timeout_s` + `imu_stale_action=fault`；默认 warn）
+- 电机 type-2 反馈 stale（`feedback_hold_max_s` + `stale_action=fault`；默认 hold）
+- CAN `BUS-OFF`（始终 fault）；`ERROR-PASSIVE`（`can_error_action=fault` 时）
 - EnteringPosition 阶段关节偏差超限
 
 故障恢复: `clear_fault=true` → 重新发送 stop(clear_fault=1) + motion_mode + enable → WaitFeedback

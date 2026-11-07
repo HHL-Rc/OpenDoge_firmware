@@ -40,17 +40,17 @@ JOINT_SIGN = np.array([
 ], dtype=float)
 
 JOINT_LOWER = np.array([
-    -0.785, -0.785, -2.68,
-    -0.26,  -0.785, -2.68,
-    -0.785, -0.785, -2.68,
-    -0.26,  -0.785, -2.68,
+    -1.0000, -1.0468, -2.68,
+    -0.5218, -1.0468, -2.68,
+    -0.9000, -0.8500, -2.68,
+    -0.5218, -0.8500, -2.68,
 ])
 
 JOINT_UPPER = np.array([
-    0.26,  1.134, -1.04,
-    0.785, 1.134, -1.04,
-    0.26,  1.134, -1.04,
-    0.785, 1.134, -1.04,
+    0.5218, 1.3958, -1.04,
+    1.0000, 1.3958, -1.04,
+    0.5218, 1.3958, -1.04,
+    0.9300, 1.3958, -1.04,
 ])
 
 MAX_POSITION_STEP = 0.015  # rad/target_tick
@@ -251,6 +251,20 @@ def test_target_computation():
     # LowGainTest: target forced to DEFAULT_POS (no action offset)
     tgt_low_gain = DEFAULT_POS.copy()  # action ignored
     check("lowgain target=default", np.allclose(tgt_low_gain, DEFAULT_POS))
+
+    # Stand-up handover blend: at alpha=0 the applied target is the default
+    # pose; at alpha=1 it is the full policy target; the applied target is
+    # rate-limited during the one-shot window.
+    policy_tgt = DEFAULT_POS + np.full(NUM_JOINTS, 0.9)
+    blend0 = DEFAULT_POS + 0.0 * (policy_tgt - DEFAULT_POS)
+    check("handover alpha0=default", np.allclose(blend0, DEFAULT_POS))
+    blend1 = DEFAULT_POS + 1.0 * (policy_tgt - DEFAULT_POS)
+    check("handover alpha1=policy", np.allclose(blend1, policy_tgt))
+    blend_mid = DEFAULT_POS + 0.5 * (policy_tgt - DEFAULT_POS)
+    check("handover mid", np.allclose(blend_mid, DEFAULT_POS + 0.45))
+    limited_mid = rate_limit(blend_mid[0], DEFAULT_POS[0], MAX_POSITION_STEP)
+    check("handover rate-limit",
+          abs(limited_mid - DEFAULT_POS[0]) <= MAX_POSITION_STEP + 1e-12)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

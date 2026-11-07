@@ -32,8 +32,8 @@ exec /usr/bin/python3 /home/orangepi/Opendoge/OpenDoge_firmware/hardware/imu/dm_
     --device "$$device" \
     --baud 921600 \
     --configure-usb \
-    --output /tmp/opendoge_imu.state \
-    --gyro-lowpass-hz 40'
+    --output /tmp/opendoge_imu.state'
+    #--gyro-lowpass-hz 40' 低通使用IIR平均算出高频信号减小震荡，对低频信号无影响，需要再加
 
 Restart=always
 RestartSec=3

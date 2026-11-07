@@ -149,19 +149,22 @@ REST_POSE = np.array([
    -0.230,  1.084, -2.681,   # RR
 ])
 
-# 固件 URDF 关节限位 (rad, 固件约定) — 实机机械限位
+# 固件 URDF 关节限位 (rad, 固件约定)。
+# 2026-11-06 (修改 54): 已对齐 LainLab 训练限位和实机手掰可用范围，
+# 与 deploy/configs/opendoge_deploy.conf 保持一致；旧的
+# hip 0.26/0.785、thigh 1.134 比训练窄，会让策略目标在 clamp 处饱和。
 FIRMWARE_JOINT_LOWER = np.array([
-    -0.785, -0.785, -2.68,   # FL
-    -0.26,  -0.785, -2.68,   # FR
-    -0.785, -0.785, -2.68,   # RL
-    -0.26,  -0.785, -2.68,   # RR
+    -1.0000, -1.0468, -2.68,   # FL
+    -0.5218, -1.0468, -2.68,   # FR
+    -0.9000, -0.8500, -2.68,   # RL
+    -0.5218, -0.8500, -2.68,   # RR
 ])
 
 FIRMWARE_JOINT_UPPER = np.array([
-    0.26,  1.134, -1.04,     # FL
-    0.785, 1.134, -1.04,     # FR
-    0.26,  1.134, -1.04,     # RL
-    0.785, 1.134, -1.04,     # RR
+    0.5218, 1.3958, -1.04,     # FL
+    1.0000, 1.3958, -1.04,     # FR
+    0.5218, 1.3958, -1.04,     # RL
+    0.9300, 1.3958, -1.04,     # RR
 ])
 
 # LainLab URDF 关节限位映射到固件约定 (JOINT_SIGN * training_limits)。
@@ -219,6 +222,16 @@ class DeployConfig:
     pc_startup_ramp_s: float = 2.0
     pc_startup_max_deviation: float = 2.0  # MuJoCo 从 REST_POSE (~2 rad from stand) 启动，需大容差。硬件侧为 0.25 (C++ config)
     standup_duration_s: float = 4.0       # 趴伏/远离站姿起身时长
+    standup_settle_s: float = 1.0         # 斜坡到位后保持默认姿态的稳定时间
+    standup_handover_s: float = 1.0       # 交接后策略目标从默认姿态淡入的时长
+    # Investigation-only sensor delay/loss models. They are applied to the
+    # observation path only; the plant/PD still uses current state.
+    imu_delay_ms: float = 0.0
+    joint_delay_ms: float = 0.0
+    packet_loss: float = 0.0
+    loss_burst_ms: float = 0.0
+    loss_target: str = "joint"  # joint|bus|all
+    cmd_loss: float = 0.0
     lin_vel_mode: str = "true"  # true|zero|command|noisy — base_lin_vel 消融
 
 
@@ -921,6 +934,16 @@ class DeployController:
                 f"got {self.lin_vel_mode!r}"
             )
         self._rng = np.random.default_rng(seed)
+        # Sensor history / loss state for --imu-delay-ms/--joint-delay-ms/
+        # --packet-loss/--cmd-loss. The history is observation-only.
+        self._sensor_history = []
+        self._loss_rng = np.random.default_rng(seed + 0x5EED)
+        self._loss_remaining = np.zeros(NUM_JOINTS)
+        self._loss_remaining_bus = np.zeros(4)
+        self._loss_hold_q = None
+        self._loss_hold_dq = None
+        self._cmd_loss_remaining = 0.0
+        self._applied_target = DEFAULT_POS.copy()
 
         # 状态机变量
         self.runtime_state = RuntimeState.WaitFeedback
@@ -936,6 +959,7 @@ class DeployController:
         self.limited_target = DEFAULT_POS.copy()
         self.pc_startup_start_s = 0.0
         self.standup_start_s = 0.0
+        self.standup_handover_start_s = -1.0
 
         # 快照时间戳
         self._last_infer_tick = -1
@@ -963,6 +987,45 @@ class DeployController:
         # noisy: true velocity + 训练时的 U(-0.5, 0.5) m/s 噪声
         return true_lin_vel + self._rng.uniform(-0.5, 0.5, 3)
 
+    def _delayed_snapshot(self, t: float, delay_s: float):
+        """Return the newest history entry at or before t-delay_s.
+
+        Observation-only: the PD/plant must keep using the current state.
+        """
+        if delay_s <= 0.0 or not self._sensor_history:
+            return None
+        target = t - delay_s
+        for entry in reversed(self._sensor_history):
+            if entry[0] <= target:
+                return entry
+        return self._sensor_history[0]
+
+    def _update_loss_state(self, config: DeployConfig, dt: float) -> None:
+        """Update per-joint/bus/all packet-loss hold timers (target rate)."""
+        max_burst = max(config.loss_burst_ms / 1000.0, dt)
+        if config.loss_target == "all":
+            if self._loss_remaining[0] <= 0.0 and self._loss_rng.random() < config.packet_loss:
+                self._loss_remaining[:] = max_burst
+            else:
+                self._loss_remaining[:] = np.maximum(0.0, self._loss_remaining[:] - dt)
+            return
+        if config.loss_target == "bus":
+            for b in range(4):
+                if (self._loss_remaining_bus[b] <= 0.0
+                        and self._loss_rng.random() < config.packet_loss):
+                    self._loss_remaining_bus[b] = max_burst
+                else:
+                    self._loss_remaining_bus[b] = max(
+                        0.0, self._loss_remaining_bus[b] - dt)
+            for i in range(NUM_JOINTS):
+                self._loss_remaining[i] = self._loss_remaining_bus[i // 3]
+            return
+        for i in range(NUM_JOINTS):
+            if self._loss_remaining[i] <= 0.0 and self._loss_rng.random() < config.packet_loss:
+                self._loss_remaining[i] = max_burst
+            else:
+                self._loss_remaining[i] = max(0.0, self._loss_remaining[i] - dt)
+
     def _check_startup_deviation(self) -> bool:
         """检查 ramp 期间关节偏离 DEFAULT_POS (防失控，与 C++ 一致)"""
         q = self.sim.get_joint_positions()
@@ -975,6 +1038,16 @@ class DeployController:
         """执行一个控制周期。返回 True 继续，False 退出。"""
         t = self.sim.data.time
         config = self.config
+        # Observation-only sensor history (used by the delay model). Filled
+        # every controller step so the delay resolution is the sim timestep.
+        self._sensor_history.append((
+            t,
+            self.sim.get_imu(),
+            self.sim.get_joint_positions().copy(),
+            self.sim.get_joint_velocities().copy(),
+        ))
+        if len(self._sensor_history) > 2000:
+            del self._sensor_history[:len(self._sensor_history) - 2000]
         self.keyboard.process_keys()
         command = self._get_command()
 
@@ -1013,6 +1086,7 @@ class DeployController:
                     # no policy; the target ramps from the measured pose.
                     self.runtime_state = RuntimeState.StandingUp
                     self.standup_start_s = t
+                    self.standup_handover_start_s = -1.0
                     self.limited_target = self.sim.get_joint_positions().copy()
                     print(f"\n[{t:.3f}s] Ready → StandingUp (远离站姿)")
                 elif command.rl_inference:
@@ -1051,11 +1125,14 @@ class DeployController:
                 if not command.active:
                     self.runtime_state = RuntimeState.Ready
                     print(f"\n[{t:.3f}s] StandingUp → Ready (取消)")
-                elif t - self.standup_start_s >= config.standup_duration_s:
+                elif t - self.standup_start_s >= (
+                    config.standup_duration_s + config.standup_settle_s
+                ):
                     self.runtime_state = (
                         RuntimeState.ActiveRL if command.rl_inference
                         else RuntimeState.ActivePC
                     )
+                    self.standup_handover_start_s = t
                     print(f"\n[{t:.3f}s] StandingUp → {self.runtime_state.name}")
 
             # ── ActivePC / ActiveRL → Ready ──
@@ -1093,12 +1170,41 @@ class DeployController:
             ):
                 self.phase = advance_phase(command, self.phase, 1.0 / config.inference_hz)
                 imu = self.sim.get_imu()
+                q_obs = self.sim.get_joint_positions()
+                dq_obs = self.sim.get_joint_velocities()
+                # Observation-only delays: never feed these into the plant/PD.
+                if config.imu_delay_ms > 0.0:
+                    snap = self._delayed_snapshot(t, config.imu_delay_ms / 1000.0)
+                    if snap is not None:
+                        src = snap[1]
+                        imu = ImuSample(
+                            linear_velocity=src.linear_velocity.copy(),
+                            angular_velocity=src.angular_velocity.copy(),
+                            projected_gravity=src.projected_gravity.copy(),
+                            valid=src.valid,
+                        )
+                if config.joint_delay_ms > 0.0:
+                    snap = self._delayed_snapshot(t, config.joint_delay_ms / 1000.0)
+                    if snap is not None:
+                        q_obs = snap[2].copy()
+                        dq_obs = snap[3].copy()
+                if config.packet_loss > 0.0:
+                    if self._loss_hold_q is None:
+                        self._loss_hold_q = q_obs.copy()
+                        self._loss_hold_dq = dq_obs.copy()
+                    for i in range(NUM_JOINTS):
+                        if self._loss_remaining[i] > 0.0:
+                            q_obs[i] = self._loss_hold_q[i]
+                            dq_obs[i] = self._loss_hold_dq[i]
+                        else:
+                            self._loss_hold_q[i] = q_obs[i]
+                            self._loss_hold_dq[i] = dq_obs[i]
                 imu.linear_velocity = self._resolve_linear_velocity(
                     imu.linear_velocity, command
                 )
                 obs = build_observation(
-                    self.sim.get_joint_positions(),
-                    self.sim.get_joint_velocities(),
+                    q_obs,
+                    dq_obs,
                     DEFAULT_POS,
                     self.last_action,
                     command,
@@ -1125,6 +1231,20 @@ class DeployController:
         target_tick = int(t * config.target_hz)
         if target_tick != self._last_target_tick:
             self._last_target_tick = target_tick
+            # 起身交接：第一帧策略动作可能很大，先从默认姿态淡入，
+            # 避免 calf 目标瞬跳（与 controller.cpp updateTargets 一致）。
+            handover = (
+                self.runtime_state in (RuntimeState.ActiveRL, RuntimeState.ActivePC)
+                and self.standup_handover_start_s >= 0.0
+                and t - self.standup_handover_start_s < config.standup_handover_s
+            )
+            alpha = 1.0
+            if handover:
+                alpha = min(
+                    (t - self.standup_handover_start_s)
+                    / max(config.standup_handover_s, 1e-6),
+                    1.0,
+                )
             for i in range(NUM_JOINTS):
                 # 训练无裁剪；last_action 观测原始策略输出
                 self.last_action[i] = self.action[i]
@@ -1136,8 +1256,13 @@ class DeployController:
                            + JOINT_SIGN[i] * self.last_action[i] * config.action_scale)
                 tgt = np.clip(tgt, JOINT_LOWER[i], JOINT_UPPER[i])
                 self.logical_target[i] = tgt
+                if handover:
+                    blended = DEFAULT_POS[i] + alpha * (tgt - DEFAULT_POS[i])
+                    self.limited_target[i] = rate_limit(
+                        blended, self.limited_target[i], MAX_POSITION_STEP
+                    )
                 # RL 模式跳过 rate_limit，策略训练时目标瞬时切换，无平滑延迟
-                if self.runtime_state == RuntimeState.ActiveRL:
+                elif self.runtime_state == RuntimeState.ActiveRL:
                     self.limited_target[i] = tgt
                 else:
                     step = MAX_POSITION_STEP
@@ -1148,6 +1273,21 @@ class DeployController:
                     self.limited_target[i] = rate_limit(
                         self.logical_target[i], self.limited_target[i], step
                     )
+
+            # Loss models are driven at the 200 Hz target rate. A dropped
+            # command holds the last applied target (the motor keeps its last
+            # CAN command); a feedback drop holds the last observed q/dq.
+            tick = 1.0 / max(config.target_hz, 1.0)
+            if config.cmd_loss > 0.0:
+                if (self._cmd_loss_remaining <= 0.0
+                        and self._loss_rng.random() < config.cmd_loss):
+                    self._cmd_loss_remaining = max(
+                        config.loss_burst_ms / 1000.0, tick)
+                else:
+                    self._cmd_loss_remaining = max(
+                        0.0, self._cmd_loss_remaining - tick)
+            if config.packet_loss > 0.0:
+                self._update_loss_state(config, tick)
 
         # --- 控制块 (1000 Hz, 与 C++ controller.cpp computeMotorCommands 一致) ---
         is_active = self.runtime_state in (RuntimeState.ActivePC, RuntimeState.ActiveRL)
@@ -1189,6 +1329,12 @@ class DeployController:
             kp_gains = np.full(NUM_JOINTS, config.kp)
             kd_gains = np.full(NUM_JOINTS, config.kd)
             target_positions = self.limited_target
+
+        if config.cmd_loss > 0.0:
+            if self._cmd_loss_remaining > 0.0:
+                target_positions = self._applied_target.copy()
+            else:
+                self._applied_target = target_positions.copy()
 
         self.sim.apply_pd_control(target_positions, kp_gains, kd_gains)
 
@@ -1350,6 +1496,30 @@ def parse_args():
         help="模拟 RL 推理失败率 (0-1, 用于测试降级)"
     )
     p.add_argument(
+        "--imu-delay-ms", type=float, default=0.0,
+        help="观测路径的 IMU 延迟 (ms)；PD/plant 仍用当前状态"
+    )
+    p.add_argument(
+        "--joint-delay-ms", type=float, default=0.0,
+        help="观测路径的关节 q/dq 延迟 (ms)；PD/plant 仍用当前状态"
+    )
+    p.add_argument(
+        "--packet-loss", type=float, default=0.0,
+        help="每个 target tick 的关节反馈丢包概率 (0-1)"
+    )
+    p.add_argument(
+        "--loss-burst-ms", type=float, default=0.0,
+        help="丢包 burst 持续时间 (ms)；0 = 一个 target tick"
+    )
+    p.add_argument(
+        "--loss-target", choices=["joint", "bus", "all"], default="joint",
+        help="丢包作用对象: joint=单关节, bus=整条腿/总线, all=全部"
+    )
+    p.add_argument(
+        "--cmd-loss", type=float, default=0.0,
+        help="每个 target tick 的命令丢包概率 (保持上一目标)"
+    )
+    p.add_argument(
         "--policy", type=str, default="",
         help="ONNX 策略模型路径 (使用真实 RL 推理替代 mock 策略)"
     )
@@ -1409,6 +1579,12 @@ def main():
         pc_startup_ramp_s=args.ramp,
         pc_startup_max_deviation=args.max_deviation,
         lin_vel_mode=args.lin_vel_mode,
+        imu_delay_ms=args.imu_delay_ms,
+        joint_delay_ms=args.joint_delay_ms,
+        packet_loss=args.packet_loss,
+        loss_burst_ms=args.loss_burst_ms,
+        loss_target=args.loss_target,
+        cmd_loss=args.cmd_loss,
     )
     keyboard = KeyboardHandler(quit_only=args.joystick is not None)
     command_source = keyboard

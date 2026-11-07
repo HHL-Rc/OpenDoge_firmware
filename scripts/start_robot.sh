@@ -128,8 +128,9 @@ verify_can() {
     echo "Troubleshooting:" >&2
     echo "  sudo systemctl status opendoge-can" >&2
     echo "  sudo journalctl -u opendoge-can -n 40" >&2
+    echo "  sudo scripts/reset_can_usb.sh   # CHIWU 板断电/复位后, 或 gs_usb err=-110" >&2
     echo "  lsusb ; for i in 0 1 2 3; do readlink -f /sys/class/net/can\$i/device/driver; done" >&2
-    echo "  sudo journalctl -k | grep -Ei 'usb.*disconnect|can[0-9]|gs_usb'  # USB enumeration" >&2
+    echo "  sudo journalctl -k | grep -Ei 'usb.*disconnect|can[0-9]|gs_usb|Couldn.t start device'  # USB enumeration" >&2
     return 1
   fi
   return 0

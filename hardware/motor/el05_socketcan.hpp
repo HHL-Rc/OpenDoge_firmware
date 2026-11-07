@@ -46,6 +46,7 @@ private:
   {
     std::string name;
     int fd{-1};
+    std::size_t index{0};  // 0=can0 ... 3=can3 for CanStats::buses
   };
 
   static double clamp(double value, double lower, double upper);
