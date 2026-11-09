@@ -38,7 +38,7 @@ if(OPENDOGE_ENABLE_ONNX)
       $ENV{ONNXRUNTIME_ROOT}/lib
       /usr/local/lib
       /usr/lib
-      /usr/lib/x86_64-linux-gnu
+      /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}
   )
   if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIBRARY)
     get_filename_component(ONNXRUNTIME_LIBRARY_DIR "${ONNXRUNTIME_LIBRARY}" DIRECTORY)

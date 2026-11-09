@@ -1,0 +1,10 @@
+# OpenDoge gamepad (/dev/input/js0)
+# opendoge-joystick is a user service; on Ubuntu the kernel's js0 is often
+# root:input 0660, which the desktop user cannot open. Make the joystick
+# device readable by the service user.
+#
+# If you prefer not to use 0666:
+#   SUBSYSTEM=="input", KERNEL=="js[0-9]*", GROUP="input", MODE="0660"
+# and add the user to the input group:
+#   sudo usermod -aG input orangepi   # re-login afterwards
+SUBSYSTEM=="input", KERNEL=="js[0-9]*", MODE="0666"

@@ -153,6 +153,29 @@ source install/setup.bash
 
 如果未找到 ONNX Runtime，`opendoge_deploy` 仍会构建，但只支持 `none` / `linear_csv` 后端（无法加载 ONNX 模型）。
 
+### Orange Pi 5 / aarch64
+
+不要复用 x86 的 `build/`/`install/`。`setup_onnx.sh` 会按 `uname -m` 自动选择
+aarch64 的 ONNX Runtime；建议独立构建目录：
+
+```bash
+DEPS_DIR="$PWD/build_aarch64/deps" ./scripts/setup_onnx.sh
+export ONNXRUNTIME_ROOT="$(realpath build_aarch64/deps/onnxruntime)"
+colcon build --symlink-install --packages-select opendoge_deploy \
+  --build-base build_aarch64 --install-base install_aarch64 --log-base log_aarch64
+source install_aarch64/setup.bash
+```
+
+以普通用户运行 deploy 需要文件 capabilities（每次 rebuild 后重跑）：
+
+```bash
+bash scripts/setup_deploy_caps.sh
+# 或：bash scripts/setup_deploy_caps.sh install_aarch64/opendoge_deploy/bin/opendoge_deploy
+```
+
+完整移植步骤（传输、服务自启、CAN 映射、CPU 绑核、排障）见
+[docs/x86_to_orangepi_porting.md](docs/x86_to_orangepi_porting.md)。
+
 ## 验证 IMU
 
 ```bash

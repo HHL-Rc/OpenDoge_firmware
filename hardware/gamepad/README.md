@@ -220,6 +220,12 @@ systemctl --user enable --now opendoge-joystick
 loginctl enable-linger   # 确保用户服务在开机时启动
 ```
 
+> **js0 权限**：Ubuntu 上 `/dev/input/js0` 常见为 `root:input 0660`，
+> user 服务可能打不开。`scripts/install_services.sh` 会把
+> `hardware/gamepad/99-opendoge-gamepad.rules` 安装到 `/etc/udev/rules.d/`
+> （`js*` MODE=0666）；手动安装服务时也要复制该规则并 reload udev。
+> 若不想放宽到 0666，可改 `GROUP="input", MODE="0660"` 并把用户加入 `input` 组。
+
 ### 日常管理
 
 ```bash

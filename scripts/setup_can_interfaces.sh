@@ -33,7 +33,10 @@ setup_once() {
       return 1
     fi
     ip link set "${iface}" down 2>/dev/null || true
-    if ! ip link set "${iface}" type can bitrate 1000000 fd off loopback off; then
+    # 5.10 的 gs_usb 不支持 CAN_CTRLMODE_FD；显式 "fd off" 会作为
+    # ctrlmode 掩码下发并被 can_changelink() 以 EOPNOTSUPP 拒绝。
+    # 经典 CAN 默认就是 FD off / loopback off，只设 bitrate 即可。
+    if ! ip link set "${iface}" type can bitrate 1000000; then
       echo "${iface}: ip link set type can failed" >&2
       return 1
     fi

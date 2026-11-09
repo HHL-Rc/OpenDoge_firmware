@@ -69,6 +69,17 @@ if ! command -v sudo &>/dev/null; then
     exit 1
 fi
 
+# Runtime dependencies used by the units/scripts. Missing ones are warnings
+# here; the user can install them before starting the robot.
+for cmd in ip udevadm loginctl python3; do
+    if ! command -v "${cmd}" &>/dev/null; then
+        echo "      [WARN] missing command: ${cmd} (install iproute2/systemd/python3)"
+    fi
+done
+if ! command -v lsusb &>/dev/null; then
+    echo "      [WARN] missing lsusb (sudo apt install usbutils); gamepad detection needs it"
+fi
+
 # 旧 DingLab 方案清理：先停 bridge，再删 vcan 接口，否则原生 can0-3
 # 无法创建（同名接口已被 vcan 占用）。
 echo "      Cleaning up old DINGLAB vcan/bridge units (if any) ..."
@@ -142,6 +153,16 @@ if [ ! -e /dev/input/js0 ]; then
     echo "        sudo systemctl status opendoge-xboxdrv"
     echo "        lsusb | grep -E '413d:2104|3537:1041|3537:2106'"
     echo "        journalctl -u opendoge-xboxdrv -n 30"
+fi
+
+# Gamepad js0: opendoge-joystick is a user service. Ubuntu often creates
+# /dev/input/js0 as root:input 0660, which the login user cannot open.
+if [[ -f "${ROOT_DIR}/hardware/gamepad/99-opendoge-gamepad.rules" ]]; then
+    sudo cp "${ROOT_DIR}/hardware/gamepad/99-opendoge-gamepad.rules" /etc/udev/rules.d/
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --action=change --subsystem-match=input 2>/dev/null || true
+    echo "      Installed gamepad udev rule → /etc/udev/rules.d/99-opendoge-gamepad.rules"
+    echo "      (if js0 is still 0660, replug the receiver or reboot)"
 fi
 
 # ═══════════════════════════════════════════════════════════════════

@@ -1,0 +1,2 @@
+# ROS 1 catkin description package (legacy). Not part of the colcon build;
+# MuJoCo/deploy read docs/URDF/xml and docs/URDF/urdf by file path.

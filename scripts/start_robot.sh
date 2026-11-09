@@ -10,7 +10,18 @@ COMMAND_FILE="${COMMAND_FILE:-/tmp/opendoge_command.state}"
 IMU_FILE="${IMU_FILE:-/tmp/opendoge_imu.state}"
 STATUS_FILE="${STATUS_FILE:-/tmp/opendoge_status.json}"
 CONFIG_FILE="${CONFIG_FILE:-${ROOT_DIR}/deploy/configs/opendoge_deploy.conf}"
-DEPLOY_BIN="${DEPLOY_BIN:-${ROOT_DIR}/install/opendoge_deploy/bin/opendoge_deploy}"
+# Prefer an explicit DEPLOY_BIN, then INSTALL_BASE, then the usual
+# install/ and install_aarch64/ layouts (Orange Pi builds use the latter).
+if [ -z "${DEPLOY_BIN:-}" ]; then
+  DEPLOY_BIN=""
+  for base in "${INSTALL_BASE:-}" "${ROOT_DIR}/install" "${ROOT_DIR}/install_aarch64"; do
+    if [ -n "${base}" ] && [ -x "${base}/opendoge_deploy/bin/opendoge_deploy" ]; then
+      DEPLOY_BIN="${base}/opendoge_deploy/bin/opendoge_deploy"
+      break
+    fi
+  done
+  DEPLOY_BIN="${DEPLOY_BIN:-${ROOT_DIR}/install/opendoge_deploy/bin/opendoge_deploy}"
+fi
 POLICY_BACKEND="${POLICY_BACKEND:-onnx}"
 POLICY_PATH="${POLICY_PATH:-}"
 REALTIME_ARGS="${REALTIME_ARGS-}"
@@ -50,6 +61,8 @@ Environment:
   COMMAND_FILE     command.state path, default: /tmp/opendoge_command.state
   IMU_FILE         imu.state path, default: /tmp/opendoge_imu.state
   CONFIG_FILE      deploy config path
+  DEPLOY_BIN       deploy binary path (default: auto-detect install/ or install_aarch64/)
+  INSTALL_BASE     colcon install base, e.g. install_aarch64
   POLICY_PATH      ONNX path, default: <repo>/policy/opendoge_flat.onnx
   POLICY_BACKEND   policy backend, default: onnx
   REALTIME_ARGS    optional deploy realtime args, e.g. "--realtime --cpu 0"
