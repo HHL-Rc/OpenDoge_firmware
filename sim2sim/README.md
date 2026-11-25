@@ -1,79 +1,104 @@
 # OpenDoge MuJoCo 仿真测试
 
-```bash
-cd /home/lain/OpenDoge/OpenDoge_firmware && python3 sim2sim/deploy_mujoco.py --mode idle
-```
+本目录只放**仿真脚本与地形生成**，不放机器人 XML/STL。机器人描述仍归属训练仓库
+`OpenDoge_train`（训练资产）和 `docs/URDF/`（固件/实机资产）。
 
-cd /home/lain/OpenDoge/OpenDoge_firmware && python3 sim2sim/deploy_mujoco.py --mode rl --policy policy/opendoge_r5.onnx
+## 当前策略契约
 
+- ONNX 输入：`obs_history` `[batch, 235]`（5 帧 × 47 维）
+- ONNX 输出：`actions` `[batch, 12]`
+- 策略 50 Hz，PD 200 Hz
+- 无 `base_lin_vel`（盲本体策略）
+- 动作缩放 hip 0.25 / thigh 0.4 / calf 0.4
 
-## 测试脚本
-
-| 脚本 | 用途 | 用法 |
-|---|---|---|
-| `deploy_mujoco.py` | OpenDoge MuJoCo 仿真，复现 deploy 控制回路（状态机、PD 控制、RL 推理） | `python3 sim2sim/deploy_mujoco.py --mode idle` |
-| `calc_zero_offset.py` | 计算 URDF 零位 → 平地趴伏的补偿角度 | `python3 sim2sim/calc_zero_offset.py` |
-
-## 依赖
+## 平坦地形（推荐入口）
 
 ```bash
-pip install mujoco numpy
+cd sim2sim
+python3 deploy_mujoco.py \
+  --training-root ../../OpenDoge_train \
+  --start-pose default --mode rl \
+  --policy ../policy/opendoge_supermimic_rough_20000.onnx \
+  --cmd 0.4 0 0 --duration 10 --no-render
 ```
 
-## deploy_mujoco.py 用法
+- `--training-root` 默认自动查找同级 `../OpenDoge_train`。
+- `--joint-convention` 默认 `training`，使用训练 XML（镜像轴、无执行器）。
+- 不指定 `--model` 时使用训练 `scene_opendoge.xml`。
+- 观测/目标/相位与 `deploy/src/observer.cpp`、`controller.cpp` 同步。
+
+## 手柄
 
 ```bash
-python3 sim2sim/deploy_mujoco.py                          # 位置控制模式
-python3 sim2sim/deploy_mujoco.py --mode idle              # 待机模式 (阻尼趴伏)
-python3 sim2sim/deploy_mujoco.py --mode rl                # RL 推理模式 (模拟)
-python3 sim2sim/deploy_mujoco.py --duration 10            # 运行 10 秒
-python3 sim2sim/deploy_mujoco.py --no-render              # 无渲染 (headless)
-python3 sim2sim/deploy_mujoco.py --cmd 0.3 0 0            # 静态速度命令
+python3 deploy_mujoco.py \
+  --training-root ../../OpenDoge_train \
+  --start-pose default \
+  --joystick \
+  --policy ../policy/opendoge_supermimic_rough_20000.onnx
 ```
 
-### 键盘控制 (渲染窗口)
+手柄默认适配 BEITONG BTP-KP70C（`20bc:5174`，原生 js0）：
+
+- A/B/X/Y = btn0/1/3/4；
+- 左摇杆 axis1/0，右摇杆 axis2；
+- X 直接进入 ActiveRL（不需要先按 A；A 仍用于清 fault/PC）；
+- M6=btn13（Back/low_gain）、M5=btn14（Start/使能）默认不指定；
+  需要时加 `--joy-btn-back 13 --joy-btn-start 14`。
+
+A：PC 站立（不跑策略）→ X：ActiveRL → 左摇杆 vx/vy，右摇杆 yaw → B 回阻尼。
+
+## 地形
+
+```bash
+# rough
+python3 deploy_mujoco.py \
+  --training-root ../../OpenDoge_train \
+  --terrain rough --terrain-level 1 \
+  --start-pose default --mode rl \
+  --policy ../policy/opendoge_supermimic_rough_20000.onnx \
+  --cmd 0.4 0 0 --duration 10 --no-render
+
+# stairs / boxes / slope
+python3 deploy_mujoco.py ... --terrain stairs --terrain-level 1
+python3 deploy_mujoco.py ... --terrain boxes  --terrain-level 1
+python3 deploy_mujoco.py ... --terrain slope  --terrain-level 1
+```
+
+地形场景生成在临时目录：复制训练 `opendoge.xml` + 为训练 STL 建软链接 +
+写地形 XML。**不复制 19 MB 资产到 sim2sim**，也不修改训练仓库。
+
+摔倒是 `projected_gravity` 超过 `--fall-angle-deg`（默认 70°）判定；
+`--auto-reset` 会在摔倒后重置到默认姿态并重新开始 ActiveRL 回合。
+
+批量测试：
+
+```bash
+python3 test/terrain_sweep.py \
+  --policy policy/opendoge_supermimic_rough_20000.onnx \
+  --terrains flat,rough,stairs,boxes,slope --duration 10
+```
+
+## 键盘
 
 | 按键 | 功能 |
 |---|---|
-| A / Space | 激活位置控制 (EnteringPosition → ActivePC) |
-| B | 停用 (→ Ready, 阻尼) |
-| X | 切换到 RL 推理模式 |
-| Y | 切换回位置控制模式 |
-| Backspace | 急停 (estop) |
+| A / Space | PC 站立（不跑策略） |
+| X | 进入 ActiveRL |
+| Y | 回 ActivePC |
+| B | 回阻尼 |
+| ↑ / ↓ / ← / → | 速度命令 |
+| Backspace | 急停 |
 | Esc / Q | 退出 |
 
-## 碰撞体配置 (Opendoge.xml)
+## 物理对齐
 
-| Geom | contype | conaffinity | 说明 |
-|---|---|---|---|
-| base_link mesh | `1` | `1` | 机身碰撞 — 趴伏时撑在地面 |
-| hip mesh | 继承默认 `1` | `1` | 髋关节 mesh 碰撞 |
-| thigh mesh | `0` | `0` | 视觉 mesh — 趴伏时悬空，不碰地 |
-| calf mesh | 继承默认 `1` | `1` | 小腿 mesh 碰撞 |
-| 脚底球体 | `1` | `1` | 足端碰撞球 (r=0.015) |
-| 脚视觉 mesh | `0` | `0` | 足端视觉 mesh |
+`--joint-convention training` 时使用 mjlab 运行时参数：`timestep=0.005`、
+`iterations=10`、`ls_iterations=20`、`armature=0.005`、足端 `condim=3` /
+`friction=[1.0,0.005,0.0005]` / `solref=[0.01,1.0]`、力矩上限 6/6/9 N·m。
 
-默认 `<geom contype="1" conaffinity="1"/>`，只对 thigh 显式关闭碰撞。
+## 已知边界
 
-## 补偿角 (URDF 零位 → 平地趴伏)
-
-全 mesh 碰撞 (thigh 除外), 关节失能仅阻尼 kd=2.0, 自由落体 10-15s 稳态实测:
-
-```
-DEFAULT_POS = np.array([
-    0.230,  1.079, -2.681,   # FL
-   -0.230,  1.079, -2.681,   # FR
-    0.231,  1.090, -2.681,   # RL
-   -0.230,  1.084, -2.681,   # RR
-])
-```
-
-| 关节 | FL | FR | RL | RR |
-|---|---|---|---|---|
-| hip | +0.230 | -0.230 | +0.231 | -0.230 |
-| thigh | +1.079 | +1.079 | +1.090 | +1.084 |
-| calf | -2.681 | -2.681 | -2.681 | -2.681 |
-
-- Calf 全部触及关节下限 -2.68 rad (mesh 碰撞硬约束)
-- Thigh 接近但未及上限 +1.134
-- 碰撞配置变更后需重跑 `calc_zero_offset.py` 验证
+- 训练 XML/STL 与 `docs/URDF/` 固件资产**不是同一套模型**（总质量、关节偏置、
+  网格原点不同）；不要混用。
+- 旧 48 维模型不兼容当前脚本；归档在 `policy/legacy_48dim/`。
+- 真机部署见 `docs/opendoge_supermimic_migration.md`。

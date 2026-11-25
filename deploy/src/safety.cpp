@@ -145,14 +145,18 @@ bool safetyFault(
         || runtime_state == RuntimeState::LowGainTest
         || runtime_state == RuntimeState::StandingUp) {
       // The stand-up target is a deliberate ramp, so a larger transient error
-      // is expected; use the wider standup thresholds there.
+      // is expected; use the wider standup thresholds there. ActiveRL is
+      // contact-rich (stairs), so it has its own, slightly wider thresholds.
       const bool standing_up = runtime_state == RuntimeState::StandingUp;
+      const bool active_rl = runtime_state == RuntimeState::ActiveRL;
       const double tracking_threshold = standing_up
         ? config.standup_tracking_error_threshold
-        : config.tracking_error_threshold;
+        : active_rl ? config.rl_tracking_error_threshold
+                    : config.tracking_error_threshold;
       const double tracking_timeout = standing_up
         ? config.standup_tracking_error_timeout_s
-        : config.tracking_error_timeout_s;
+        : active_rl ? config.rl_tracking_error_timeout_s
+                    : config.tracking_error_timeout_s;
       const double logical_actual = logicalPosition(states[i].position, calibration[i]);
       const double error = std::abs(logical_target[i] - logical_actual);
       if (error > tracking_threshold) {

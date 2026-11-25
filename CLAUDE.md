@@ -144,11 +144,13 @@ python3 hardware/motor/scan_motors_readonly.py
 `deploy/src/main.cpp` 和 `sim2sim/deploy_mujoco.py` 实现相同的控制回路。任何修改必须双向同步：
 
 - 状态机转换规则 (`RuntimeState` enum, `updateStateMachine` / `DeployController.step`)
-- 观测构建 (`buildObservation` / `build_observation`) — 49 维格式不可变
-- 步态相位 (`advancePhase` / `advance_phase`) — 公式不可变
+- 观测构建 (`buildObservationFrame` / `build_observation_frame`) — **47 维单帧、5 帧历史、235 维输入**
+- 历史缓冲 (`HistoryBuffer`) — 旧→新、重置重复首帧、进入 ActiveRL 时重置
+- 步态相位 (`gaitPhaseFeatures` / `gait_phase_features`) — 0.5 s / 25 步 / 移动门控
 - rate limiter 语义 (RL 模式跳过, PC 模式 3 rad/s)
 - PD 增益逻辑 (阻尼/斜坡/Active/LowGain)
-- `last_action` 的 clamp 语义
+- `last_action` 的原始值语义（不裁剪）
+- 策略仅 `ActiveRL` 运行；`ActivePC` 保持默认站姿
 
 ### 5. 电机 ID 映射 (不可变)
 
@@ -193,17 +195,21 @@ ONNX output[i] → action[i] → target[i] → motor_id = i+1
 全部四条腿 (固件 URDF 约定): hip=0, thigh=0.8, calf=-1.6
 ```
 
-### 7. 观测格式 (48 维，LainLab mjlab，无 privileged info)
+### 7. 观测格式 (47 维 × 5 帧，OpenDoge_train SuperMimic，无 privileged info)
 
 ```
-base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3)
-+ joint_pos_rel(12) + joint_vel_rel(12) + last_action(12) + command(3)
+base_ang_vel(3) + projected_gravity(3)
++ joint_pos_rel(12) + joint_vel_rel(12) + last_action(12)
++ command(3) + gait_phase_sin_cos(2) = 47
 ```
 
-关节量与动作需经 `kJointSign = {+1,+1,+1, +1,-1,-1, -1,+1,+1, -1,-1,-1}`
-在固件 URDF 约定与训练约定之间映射。`last_action` 为原始策略输出（不裁剪）。
-`base_lin_vel` 在真机上由 `lin_vel_source=zero|command|imu` 决定。
-详见 `sim2sim/CLAUDE.md` Round 4。
+- 策略是**盲本体策略**：没有 `base_lin_vel`；机身速度由 ONNX 内部 MoE 历史编码器估计。
+- ONNX 输入是 5 帧历史扁平化后的 **235 维**（旧→新），输出 12 维动作。
+- 动作缩放逐关节：hip 0.25 / thigh 0.4 / calf 0.4。
+- 步态相位：`steps=round(elapsed/0.02)`、`p=(steps%25)/25`、`hypot(vx,vy)+abs(yaw)>0.1` 时输出 `[sin(2πp),cos(2πp)]`，否则 0。
+- `last_action` 为原始策略输出（不裁剪）。
+- 控制频率 50 Hz（`control_dt=0.02`）。
+- 详见 `docs/opendoge_supermimic_migration.md` 与 `sim2sim/CLAUDE.md` Round 8。
 
 ## systemd 服务架构
 
@@ -231,7 +237,7 @@ opendoge-imu (auto-detect /dev/ttyUSBx by USB ID 6877:4d55) → /tmp/opendoge_im
 > `~/DingLab usb转can代码`（见 `docs/legacy/README.md`），不再安装/运行。
 
 C++ deploy 通过 `runtime_io.cpp` 的 `readImuFile()` / `readCommandFile()` 轮询这些文件。
-安全/命令轮询仍是 200 Hz；**策略观测在推理 tick（100 Hz）前会重新 `can.drain` 并
+安全/命令轮询仍是 200 Hz；**策略观测在推理 tick（50 Hz）前会重新 `can.drain` 并
 重读 IMU 文件**，避免观测等待 200 Hz 轮询相位（修改 64）。这是有意设计：
 - 实时循环 (`SCHED_FIFO`) 免于处理串口/HID I/O
 - 守护进程可独立重启
@@ -267,13 +273,13 @@ lsusb | grep 6877:4d55                              # 确认 IMU 已连接
 
 | 属性 | 值 |
 |------|-----|
-| 硬件 | 2.4G Xbox 兼容接收器（`413d:2104` 或 Zikway `3537:1041`） |
-| USB ID | `413d:2104`（xboxdrv）/ `3537:1041`（内核原生 js0） |
-| 驱动 | `413d:2104` → xboxdrv；`3537:1041` → 内核 `hid-generic`/`joydev` |
+| 硬件 | 2.4G Xbox 兼容接收器（`413d:2104`）、Zikway `3537:1041`、BEITONG `20bc:5174` |
+| USB ID | `413d:2104`（xboxdrv）/ `3537:1041`（内核原生 js0）/ `20bc:5174`（BEITONG 原生 js0） |
+| 驱动 | `413d:2104` → xboxdrv；`3537:1041` / `20bc:5174` → 内核 `hid-generic`+`joydev` |
 | 设备节点 | `/dev/input/js0`（名称取决于驱动） |
 | 桥接脚本 | `hardware/gamepad/xbox_command_bridge.py` |
 | 输出文件 | `/tmp/opendoge_command.state` |
-| 当前状态 | ⚠️ 接收器为 `3537:1041`，原生 js0；`opendoge-xboxdrv` 已改为包装脚本，按钮映射待 `jstest` 确认 |
+| 当前状态 | ⚠️ 接收器为 `3537:1041` 或 `20bc:5174`，原生 js0；`opendoge-xboxdrv` 已改为包装脚本，按钮映射待 `jstest` 确认 |
 
 **轴/按键映射** (xboxdrv 默认, 已验证):
 
@@ -297,6 +303,16 @@ lsusb | grep 6877:4d55                              # 确认 IMU 已连接
 > 与 sim2sim `--joystick` 默认值一致（sim 不含急停键）；
 > `xbox_command_bridge.py --profile auto` 会自动套用，仍建议用
 > `jstest /dev/input/js0` 确认。
+
+> BEITONG BTP-KP70C（`20bc:5174`）也创建原生 `js0`，但布局不同：
+> 左摇杆 axis1/0、右摇杆 axis3/2、A=btn0、B=btn1、X=btn3、Y=btn4、
+> LB=btn6、RB=btn7、LT/RT=axis5/6、M5/M6=btn14/13。
+> **Back/Start 不建议写死**：A/B 已覆盖启动/阻尼；Back 的 low_gain 是
+> bring-up 模式，Start 的 active 切换容易误触。当前 `--profile auto` 会清空
+> 这两个默认值，LB/RB 不会误触发。需要实体键时：M5=btn14 作为 Start、
+> M6=btn13 作为 Back，加 `--btn-back 13 --btn-start 14`。
+> X 现在可以直接进 ActiveRL（无需先按 A），A 仍用于清 fault/PC。
+> 详见 `docs/beitong_gamepad.md`。
 
 **systemd 服务** (开机自启):
 
@@ -355,7 +371,7 @@ source install/setup.bash
 ./install/opendoge_deploy/bin/opendoge_deploy --policy-backend none --duration-sec 2
 
 # MuJoCo 仿真验证
-cd test && python3 deploy_mujoco.py --mode idle --no-render --duration 2
+cd sim2sim && python3 deploy_mujoco.py --training-root ../../OpenDoge_train --mode idle --no-render --duration 2
 
 # vcan 无硬件 CAN 测试
 sudo ./scripts/setup_vcan.sh can0 can1 can2 can3
@@ -464,10 +480,12 @@ can3 (RR): ID=10(hip +0.0000) 11(thigh -0.0000) 12(calf -0.0017) — 全部运�
 2. **修改控制回路**: `controller.cpp` + `deploy_mujoco.py` 同步
 3. **修改 CAN 协议**: `el05_socketcan.cpp` + `hardware/motor/el05_motor_menu.py` + `protocol_selftest.py` 同步
 4. **新增 policy backend**: 实现 `Policy` 接口，在 `makePolicy()` 注册
-5. **XML 物理参数对齐**: 固件 `Opendoge.xml` 的物理参数必须对齐 UniLab 训练 `opendoge.xml`+`scene_flat.xml`，追踪记录见 `sim2sim/CLAUDE.md`
+5. **XML 物理参数对齐**: 训练仿真必须使用 `OpenDoge_train` 的训练 XML/STL；固件 `docs/URDF/` 是实机模型，两者质量/偏置/网格不同，不可混用。追踪记录见 `docs/opendoge_supermimic_migration.md` 与 `sim2sim/CLAUDE.md` Round 8。
 
 ## 相关仓库
 
-- UniLab 训练框架: `../UniLab/`
+- OpenDoge_train 训练框架: `../OpenDoge_train/`
+- LainLab 旧训练框架: `../LainLab/`
 - OpenDoge 硬件设计: `../OpenDoge_hardware/`
 - 模块详细文档: `deploy/CLAUDE.md`
+- 本次迁移记录: `docs/opendoge_supermimic_migration.md`

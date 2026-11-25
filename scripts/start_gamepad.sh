@@ -4,12 +4,13 @@
 # Supported 2.4G receivers:
 #   413d:2104  Xbox 360 clone dongle  -> xboxdrv creates /dev/input/js0
 #   3537:1041  Zikway HID gamepad     -> kernel hid-generic/joydev creates js0
+#   20bc:5174  BEITONG BTP-KP70C      -> kernel hid-generic/joydev creates js0
 #
 # The old opendoge-xboxdrv.service only waited for 413d:2104. This wrapper
-# keeps the service active for either receiver:
+# keeps the service active for the native-js0 receivers:
 #   - 413d:2104: exec xboxdrv (same as before)
-#   - 3537:1041: wait for /dev/input/js0, then sleep forever; the kernel driver
-#                 already provides js0, so xboxdrv is not needed.
+#   - 3537:1041 / 20bc:5174: wait for /dev/input/js0, then sleep forever; the
+#                 kernel driver already provides js0, so xboxdrv is not needed.
 #
 # 3537:2106 is a different mode of the Zikway receiver and does NOT create js0;
 # the wrapper prints a hint and keeps waiting for 1041.
@@ -52,6 +53,21 @@ while [ "$i" -lt 60 ]; do
         if [ $((i % 2)) -eq 0 ]; then
             log "receiver is in 3537:2106 mode (no js0); replug/switch mode to 3537:1041"
         fi
+    fi
+
+    if lsusb | grep -q "20bc:5174"; then
+        log "BEITONG BTP-KP70C detected; waiting for native /dev/input/js0"
+        j=0
+        while [ "$j" -lt 20 ]; do
+            if [ -e /dev/input/js0 ]; then
+                log "native js0 ready (BEITONG); kernel joydev handles input"
+                exec /bin/sleep infinity
+            fi
+            sleep 0.5
+            j=$((j + 1))
+        done
+        log "BEITONG present but /dev/input/js0 did not appear after 10s"
+        exit 1
     fi
 
     sleep 0.5

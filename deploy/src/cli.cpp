@@ -15,8 +15,8 @@ void printUsage()
 {
   std::cout
     << "Usage: opendoge_deploy [options]\n"
-    << "  --policy-backend none|linear_csv|onnx   default: none\n"
-    << "  --policy-path PATH                      ONNX or linear CSV path\n"
+    << "  --policy-backend none|onnx              default: none\n"
+    << "  --policy-path PATH                      ONNX policy path\n"
     << "  --config PATH                           deploy key=value config\n"
     << "  --command-file PATH                     command.state input (vx/vy/yaw_rate/active/estop/position_control/rl_inference)\n"
     << "  --imu-file PATH                         wx/wy/wz/gx/gy/gz input\n"
@@ -26,13 +26,14 @@ void printUsage()
     << "  --enable                                set motion mode and enable motors on startup\n"
     << "  --clear-fault                           send stop(clear_fault=1) before enable\n"
     << "  --start-active                          enter active after readiness checks\n"
+    << "  --start-rl                              start active in ActiveRL (implies --start-active)\n"
+    << "  --verify-policy                         load/validate the policy, run one inference, print and exit\n"
     << "  --low-gain                              force low_gain_mode (joystick-proof)\n"
     << "  --allow-missing-imu                     permit active with default IMU sample\n"
     << "  --realtime                              try mlockall + SCHED_FIFO\n"
     << "  --rt-priority N                         SCHED_FIFO priority (default 60)\n"
     << "  --cpu N                                 pin process to CPU N\n"
     << "  --duration-sec SEC                      stop after SEC, 0 means until Ctrl+C\n"
-    << "  --lin-vel-source zero|command|imu        base_lin_vel source for the 48-dim obs\n"
     << "  --kp K / --kd K                         override PD gains for bring-up\n"
     << "  --dump-config                           print effective calibration and exit\n"
     << "  --disable-on-exit                       send COMM_STOP to all motors on exit (default)\n"
@@ -78,6 +79,13 @@ bool parseArgs(int argc, char ** argv, Options & opt)
       } else if (arg == "--start-active") {
         opt.start_active = true;
         opt.static_command.active = true;
+      } else if (arg == "--start-rl") {
+        opt.start_active = true;
+        opt.start_rl = true;
+        opt.static_command.active = true;
+        opt.static_command.rl_inference = true;
+      } else if (arg == "--verify-policy") {
+        opt.verify_policy = true;
       } else if (arg == "--low-gain") {
         opt.low_gain = true;
       } else if (arg == "--allow-missing-imu") {
@@ -92,8 +100,6 @@ bool parseArgs(int argc, char ** argv, Options & opt)
         opt.status_file = need_value(arg);
       } else if (arg == "--duration-sec") {
         opt.duration_s = std::stod(need_value(arg));
-      } else if (arg == "--lin-vel-source") {
-        opt.lin_vel_source = need_value(arg);
       } else if (arg == "--kp") {
         opt.kp_override = std::stod(need_value(arg));
       } else if (arg == "--kd") {

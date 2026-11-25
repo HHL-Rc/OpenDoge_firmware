@@ -9,19 +9,34 @@ namespace opendoge
 
 constexpr std::size_t kNumJoints = 12;
 
-// Single-frame actor observation (LainLab mjlab velocity task, 48 dims):
-//   base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3)
-//   + joint_pos_rel(12) + joint_vel_rel(12) + last_action(12) + command(3) = 48
-// Observation terms are ordered exactly as the mjlab actor observation group.
-constexpr std::size_t kObsDim = 48;
+// Single-frame actor observation (OpenDoge_train SuperMimic, 47 dims):
+//   base_ang_vel(3) + projected_gravity(3)
+//   + joint_pos_rel(12) + joint_vel_rel(12) + last_action(12) + command(3)
+//   + gait_phase_sin_cos(2) = 47
+// The policy is blind: base_lin_vel is NOT part of the observation. The
+// 5-frame history is flattened oldest-first to 235 values before inference.
+constexpr std::size_t kObsDim = 47;
+constexpr std::size_t kObsHistoryLength = 5;
+constexpr std::size_t kObsHistoryDim = kObsDim * kObsHistoryLength;  // 235
+
+// Policy timing / gait clock (ONNX metadata: control_dt_seconds=0.02,
+// gait phase period=0.5 s, standing command threshold=0.1).
+constexpr double kPolicyHz = 50.0;
+constexpr double kPolicyDt = 1.0 / kPolicyHz;
+constexpr double kGaitPeriodS = 0.5;
+constexpr int kGaitSteps = 25;  // round(kGaitPeriodS / kPolicyDt)
+constexpr double kGaitCommandThreshold = 0.1;
+
+using ObsFrame = std::array<double, kObsDim>;
+using ObsHistory = std::array<double, kObsHistoryDim>;
 
 // Training URDF ↔ firmware URDF sign convention.
-// The LainLab model mirrors the FR/RR legs (thigh/calf axis 0 -1 0) and the
-// RL/RR hips (axis -1 0 0); the firmware URDF uses +axis for every joint.
+// The OpenDoge_train model mirrors the FR/RR legs (thigh/calf axis 0 -1 0) and
+// the RL/RR hips (axis -1 0 0); the firmware URDF uses +axis for every joint.
 //   q_train[i]      = kJointSign[i] * q_firmware[i]
 //   obs_joint_pos[i] = kJointSign[i] * (q_firmware[i] - default_firmware[i])
 //   target_firmware[i] = default_firmware[i]
-//                        + kJointSign[i] * action_scale * action_train[i]
+//                        + kJointSign[i] * action_scale[i] * action_train[i]
 // With this map the training default pose becomes the uniform firmware pose
 // below: {0, 0.8, -1.6} × 4.
 constexpr std::array<double, kNumJoints> kJointSign = {
@@ -31,8 +46,8 @@ constexpr std::array<double, kNumJoints> kJointSign = {
   -1, -1, -1,   // RR
 };
 
-// Default standing pose in firmware URDF convention (LainLab
-// OPENDOGE_INIT_STATE mapped through kJointSign: all legs become uniform).
+// Default standing pose in firmware URDF convention (OpenDoge_train
+// default_joint mapped through kJointSign: all legs become uniform).
 inline std::array<double, kNumJoints> defaultJointPosition()
 {
   return {0.0, 0.8, -1.6, 0.0, 0.8, -1.6, 0.0, 0.8, -1.6, 0.0, 0.8, -1.6};
@@ -156,19 +171,21 @@ struct JointCalibration
 
 struct DeployConfig
 {
-  double inference_hz{100.0};
+  double inference_hz{50.0};
   double target_hz{200.0};
   double control_hz{1000.0};
-  // LainLab BuiltinPositionActuatorCfg: stiffness=12.0, damping=0.5
+  // OpenDoge_train BuiltinPositionActuatorCfg: stiffness=12.0, damping=0.5.
   double kp{12.0};
   double kd{0.5};
   double safe_kd{2.0};
-  double action_scale{0.25};
-  // base_lin_vel source for the 48-dim actor observation:
-  //   "zero"    → zeros (worst case, no state estimate)
-  //   "command" → [vx, vy, 0] body-frame command approximation
-  //   "imu"     → vx/vy/vz keys from the IMU state file (if the bridge provides them)
-  std::string lin_vel_source{"command"};
+  // Per-joint action scale, in joint order (hip/thigh/calf × FL/FR/RL/RR).
+  // OpenDoge_train: hip=0.25, thigh=0.4, calf=0.4.
+  std::array<double, kNumJoints> action_scale{
+    0.25, 0.4, 0.4,  0.25, 0.4, 0.4,
+    0.25, 0.4, 0.4,  0.25, 0.4, 0.4};
+  // Gait phase clock (training observation term).
+  double gait_period_s{kGaitPeriodS};
+  double gait_command_threshold{kGaitCommandThreshold};
   double state_timeout_s{0.02};
   // Scan-like feedback recovery: for joints whose last feedback is stale,
   // send a READ_PARAM (mechPos/mechVel) instead of waiting for the next
@@ -223,6 +240,14 @@ struct DeployConfig
   double torque_timeout_s{0.5};
   double tracking_error_threshold{0.5};
   double tracking_error_timeout_s{0.3};
+  // Contact-rich RL (stairs) tolerates larger transient tracking errors than
+  // flat PC. Defaults equal the generic values; the stair profile in the
+  // config relaxes them.
+  double rl_tracking_error_threshold{0.5};
+  double rl_tracking_error_timeout_s{0.3};
+  // Keep the RL target this far inside the configured joint limits. 0 keeps
+  // the training-exact target; a small margin leaves room for impact overshoot.
+  double rl_joint_limit_margin{0.0};
   double command_timeout_s{0.5};
   double fall_gravity_z_threshold{0.3};
   double fall_timeout_s{0.3};
@@ -259,8 +284,8 @@ struct OperatorCommand
 struct ImuSample
 {
   // Body-frame linear velocity (m/s). Optional: only the IMU bridge can fill
-  // it (vx/vy/vz keys). Otherwise main.cpp synthesizes it according to
-  // DeployConfig::lin_vel_source.
+  // it (vx/vy/vz keys). The current 47x5 SuperMimic policy is blind and does
+  // not consume this field; it is kept for legacy bridges / future estimators.
   std::array<double, 3> linear_velocity{0.0, 0.0, 0.0};
   std::array<double, 3> angular_velocity{0.0, 0.0, 0.0};
   std::array<double, 3> projected_gravity{0.0, 0.0, -1.0};

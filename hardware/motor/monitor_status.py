@@ -54,6 +54,12 @@ MANAGED_LOG_RE = re.compile(r"^monitor_status_\d{8}_\d{6}(_\d{3})?\.csv$")
 CSV_HEADER = [
     "t", "state", "joint", "q", "target", "dq", "tau", "tau_j",
     "temp", "fault", "fault_sta", "age_ms", "recv", "flags",
+    # Global diagnostics: the old CSV only had per-joint rows, so a
+    # damping_fault caused by IMU fall / CAN error / tracking had no root cause.
+    "fault_reason", "imu_wz", "imu_gz", "imu_age_ms",
+    "can_rx", "can_tx", "can_err", "can_tx_queue_full",
+    "max_late_us", "missed_ctrl", "can_buses",
+    "policy_phase", "history_ready", "rl_episode",
 ]
 
 JOINT_NAMES = [
@@ -413,6 +419,17 @@ def main() -> int:
                         j.get("q"), j.get("target"), j.get("dq"), j.get("tau"),
                         f"{tau_j:.6f}", j.get("temp"), joint_fault,
                         joint_fault_sta, age, j.get("recv"), "|".join(flags),
+                        fault, imu.get("wz"), imu.get("gz"),
+                        data.get("imu_age_ms"), data.get("can_rx"),
+                        data.get("can_tx"), data.get("can_err"),
+                        data.get("can_tx_queue_full"),
+                        data.get("max_late_us"), data.get("missed_ctrl"),
+                        ",".join(
+                            f"{b.get('name')}:{b.get('state')}"
+                            for b in data.get("can_buses", [])
+                        ),
+                        data.get("policy_phase"), data.get("history_ready"),
+                        data.get("rl_episode"),
                     ])
             if write_csv:
                 last_status_sig = status_sig

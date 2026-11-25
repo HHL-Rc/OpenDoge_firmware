@@ -13,6 +13,9 @@ CPUAffinity=6 7
 ExecStartPre=/bin/sh -c 'for i in $$(seq 1 60); do [ -e /dev/input/js0 ] && exit 0; sleep 0.5; done; echo "js0 not found after 30s" >&2; exit 1'
 # --profile auto: Zikway 3537:1041 uses A=0/B=1/X=3/Y=4, START=6, BACK=7,
 # and latching emergency stop btn11. Press A after estop to clear it.
+# BEITONG BTP-KP70C (20bc:5174) is auto-detected; its Back/Start are NOT 6/7
+# (those are LB/RB), so add the jstest-confirmed numbers here:
+#   --btn-back N --btn-start M
 ExecStart=/usr/bin/python3 /home/orangepi/Opendoge/OpenDoge_firmware/hardware/gamepad/xbox_command_bridge.py \
     --output /tmp/opendoge_command.state \
     --profile auto \

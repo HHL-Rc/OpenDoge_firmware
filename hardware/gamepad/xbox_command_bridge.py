@@ -24,35 +24,69 @@ STOP = False
 
 def apply_button_profile(mapper: XboxCommandMapper, args: argparse.Namespace,
                          device_name: str) -> None:
-    """Apply native Zikway 3537:1041 button layout when appropriate.
+    """Apply a native js0 button layout when appropriate.
 
-    Native js0 mapping (aligned with sim2sim and docs/lainlab_deploy_migration.md):
-      A=0, B=1, X=3, Y=4, LB/START=6, RB/BACK=7.
-    Hardware-only latching emergency stop: btn11, the key with three parallel
-    horizontal bars to the right of Home (not used by sim2sim).
+    Zikway 3537:1041:
+      A=0, B=1, X=3, Y=4, START=6, BACK=7, latching estop=11.
+    BEITONG BTP-KP70C (20bc:5174):
+      A=0, B=1, X=3, Y=4, LB=6, RB=7.
+      Back/Start are optional: M6=btn13 (low_gain), M5=btn14 (enable).
+      They are intentionally unassigned by default (A/B already cover
+      enable/disable; START toggling active is easy to bump accidentally).
     Explicit --btn-* arguments always win.
     """
+    name = (device_name or "").lower()
     use_zikway = args.profile == "zikway" or (
-        args.profile == "auto" and "zikway" in (device_name or "").lower()
+        args.profile == "auto" and "zikway" in name
     )
-    if not use_zikway:
+    use_beitong = args.profile == "beitong" or (
+        args.profile == "auto"
+        and ("beitong" in name or "btp-kp70c" in name)
+    )
+    if use_zikway:
+        if args.btn_a is None:
+            mapper.btn_a = 0
+        if args.btn_b is None:
+            mapper.btn_b = 1
+        if args.btn_x is None:
+            mapper.btn_x = 3
+        if args.btn_y is None:
+            mapper.btn_y = 4
+        if args.btn_start is None:
+            mapper.btn_start = 6
+        if args.btn_back is None:
+            mapper.btn_back = 7
+        if args.btn_rb is None:
+            mapper.btn_rb = 11
+        if args.btn_estop is None:
+            mapper.btn_estop = 11
         return
-    if args.btn_a is None:
-        mapper.btn_a = 0
-    if args.btn_b is None:
-        mapper.btn_b = 1
-    if args.btn_x is None:
-        mapper.btn_x = 3
-    if args.btn_y is None:
-        mapper.btn_y = 4
-    if args.btn_start is None:
-        mapper.btn_start = 6
-    if args.btn_back is None:
-        mapper.btn_back = 7
-    if args.btn_rb is None:
-        mapper.btn_rb = 11
-    if args.btn_estop is None:
-        mapper.btn_estop = 11
+
+    if use_beitong:
+        if args.btn_a is None:
+            mapper.btn_a = 0
+        if args.btn_b is None:
+            mapper.btn_b = 1
+        if args.btn_x is None:
+            mapper.btn_x = 3
+        if args.btn_y is None:
+            mapper.btn_y = 4
+        if args.btn_rb is None:
+            mapper.btn_rb = 7
+        # BEITONG LB/RB are 6/7. Do not inherit Xbox BACK/START=6/7.
+        if args.btn_back is None:
+            mapper.btn_back = None
+        if args.btn_start is None:
+            mapper.btn_start = None
+        if args.btn_estop is None:
+            mapper.btn_estop = None
+        if mapper.btn_back is None or mapper.btn_start is None:
+            print(
+                "[BEITONG] Back/Start unassigned (A/B/X/Y + sticks work). "
+                "Optional: M6=btn13 low_gain, M5=btn14 enable; pass "
+                "`--btn-back 13 --btn-start 14` if you want them.",
+                file=sys.stderr,
+            )
 
 
 def handle_signal(_signum, _frame) -> None:
@@ -72,18 +106,18 @@ def parse_args() -> argparse.Namespace:
     # on 2026-11-04. LainLab flat training starts at vx ±0.8 / vy ±0.5 /
     # yaw ±0.8, so vx/vy are inside; yaw 1.0 is at/above the initial range —
     # lower --max-yaw-rate if full-stick turning is unstable.
-    parser.add_argument("--max-vx", type=float, default=0.45, help="Max forward speed command in m/s (default 50% 0.60)")
-    parser.add_argument("--max-vy", type=float, default=0.25, help="Max lateral speed command in m/s (default 50% 0.40)")
-    parser.add_argument("--max-yaw-rate", type=float, default=0.70, help="Max yaw rate command in rad/s (default 50% 1.00)")
+    parser.add_argument("--max-vx", type=float, default=0.45, help="Max forward speed command in m/s (default 50%% of 0.60)")
+    parser.add_argument("--max-vy", type=float, default=0.25, help="Max lateral speed command in m/s (default 50%% of 0.40)")
+    parser.add_argument("--max-yaw-rate", type=float, default=0.70, help="Max yaw rate command in rad/s (default 50%% of 1.00)")
     parser.add_argument("--axis-vy", type=int, default=0, help="Axis number for lateral command")
     parser.add_argument("--axis-vx", type=int, default=1, help="Axis number for forward command")
     parser.add_argument("--axis-yaw", type=int, default=2, help="Axis number for yaw command (right stick X)")
     parser.add_argument("--btn-a", type=int, default=None, help="Button number for A (default: 0)")
     parser.add_argument("--btn-b", type=int, default=None, help="Button number for B (default: 1)")
-    parser.add_argument("--btn-x", type=int, default=None, help="Button number for X (default: 3)")
-    parser.add_argument("--btn-y", type=int, default=None, help="Button number for Y (default: 4)")
-    parser.add_argument("--btn-back", type=int, default=None, help="Button number for BACK (default: 6)")
-    parser.add_argument("--btn-start", type=int, default=None, help="Button number for START (default: 7)")
+    parser.add_argument("--btn-x", type=int, default=None, help="Button number for X (profile default: 3 for Zikway/BEITONG)")
+    parser.add_argument("--btn-y", type=int, default=None, help="Button number for Y (profile default: 4 for Zikway/BEITONG)")
+    parser.add_argument("--btn-back", type=int, default=None, help="Button number for BACK (Xbox default 6; BEITONG must specify)")
+    parser.add_argument("--btn-start", type=int, default=None, help="Button number for START (Xbox default 7; BEITONG must specify)")
     parser.add_argument("--btn-rb", type=int, default=None, help="Button number for RB (default: 5)")
     parser.add_argument(
         "--btn-estop",
@@ -94,10 +128,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--profile",
-        choices=["auto", "default", "zikway"],
+        choices=["auto", "default", "zikway", "beitong"],
         default="auto",
-        help="Button profile: auto detects Zikway 3537:1041 native js0; "
-             "default uses Xbox/xboxdrv numbering",
+        help="Button profile: auto detects Zikway 3537:1041 or BEITONG "
+             "BTP-KP70C (20bc:5174) native js0; default uses Xbox/xboxdrv "
+             "numbering. BEITONG Back/Start must be given explicitly.",
     )
     parser.add_argument(
         "--require-rb",
@@ -157,10 +192,13 @@ def main() -> int:
                 name = joystick.name() or "unknown joystick"
                 apply_button_profile(mapper, args, name)
                 print(f"Joystick: {current_device} ({name})")
-                print(f"Profile:  {args.profile} (Zikway native mapping applied when detected)")
+                print(f"Profile:  {args.profile} (Zikway/BEITONG native mapping applied when detected)")
                 print(f"Writing:  {args.output}")
                 print(f"Rate:     {args.rate_hz} Hz")
-                print(f"Button mapping: A=btn{mapper.btn_a} B=btn{mapper.btn_b} X=btn{mapper.btn_x} Y=btn{mapper.btn_y} BACK=btn{mapper.btn_back} START=btn{mapper.btn_start} ESTOP=btn{mapper.btn_estop}")
+                def btn_label(value):
+                    return f"btn{value}" if value is not None else "unassigned"
+
+                print(f"Button mapping: A={btn_label(mapper.btn_a)} B={btn_label(mapper.btn_b)} X={btn_label(mapper.btn_x)} Y={btn_label(mapper.btn_y)} BACK={btn_label(mapper.btn_back)} START={btn_label(mapper.btn_start)} ESTOP={btn_label(mapper.btn_estop)}")
                 print(f"Axis mapping:   vx=axis{mapper.axis_vx} vy=axis{mapper.axis_vy} yaw=axis{mapper.axis_yaw}")
                 print("Controls:")
                 print("  Left stick   -> vx (前后) / vy (左右)")
@@ -169,8 +207,10 @@ def main() -> int:
                 print("  B            -> 退出位置控制/RL，回到阻尼 (active=false；不切断电机输出)")
                 print("  X            -> 进入 RL 推理状态 (rl_inference)")
                 print("  Y            -> 退出 RL 推理状态")
-                print("  BACK         -> 急停 (estop)")
-                print("  START        -> 切换使能")
+                print("  BACK         -> 切换 low_gain_mode")
+                print("  START        -> 切换使能 (active toggle)")
+                if mapper.btn_estop is not None:
+                    print(f"  ESTOP        -> btn{mapper.btn_estop} 锁存急停；按 A 清除")
                 if args.require_rb:
                     print("  RB (hold)    -> 使能开关 (死手)")
                 print()

@@ -50,7 +50,7 @@ Environment:
   COMMAND_FILE     command.state path, default: /tmp/opendoge_command.state
   IMU_FILE         imu.state path, default: /tmp/opendoge_imu.state
   CONFIG_FILE      deploy config path
-  POLICY_PATH      ONNX path, default: <repo>/policy/opendoge_flat.onnx
+  POLICY_PATH      ONNX path, default: <repo>/policy/opendoge_supermimic_rough_20000.onnx
   POLICY_BACKEND   policy backend, default: onnx
   REALTIME_ARGS    optional deploy realtime args, e.g. "--realtime --cpu 0"
   CALIB_OUTPUT     calibration output path, default: /tmp/opendoge_calibration.conf
@@ -220,9 +220,9 @@ case "${MODE}" in
 
   policy)
     if [[ -z "${POLICY_PATH}" ]]; then
-      POLICY_PATH="${ROOT_DIR}/policy/opendoge_flat.onnx"
+      POLICY_PATH="${ROOT_DIR}/policy/opendoge_supermimic_rough_20000.onnx"
     fi
-    require_file "${POLICY_PATH}" "policy (default: policy/opendoge_flat.onnx)"
+    require_file "${POLICY_PATH}" "policy (default: policy/opendoge_supermimic_rough_20000.onnx)"
     echo "Using policy: ${POLICY_PATH}"
     verify_all
     write_safe_command

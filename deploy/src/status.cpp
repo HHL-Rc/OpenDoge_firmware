@@ -93,7 +93,9 @@ void emitStatus(
               << " late_us=" << static_cast<int>(loop_stats.max_control_late_s * 1.0e6)
               << " missed=" << loop_stats.missed_control_deadlines
               << " ramp_pct=" << (runtime_state == RuntimeState::EnteringPosition
-                ? static_cast<int>(100.0 * (t - pc_startup_start_s) / pc_startup_ramp_s) : 100);
+                ? static_cast<int>(100.0 * (t - pc_startup_start_s) / pc_startup_ramp_s) : 100)
+              << " phase=" << loop_stats.last_phase
+              << " hist=" << (loop_stats.history_ready ? 1 : 0);
     if (runtime_state == RuntimeState::DampingFault) {
       std::cout << " fault=\"" << fault_reason << "\"";
     }
@@ -154,6 +156,8 @@ void emitStatus(
               << " can_err=" << (can_stats.read_errors + can_stats.write_errors)
               << " ramp_pct=" << (runtime_state == RuntimeState::EnteringPosition
                 ? static_cast<int>(100.0 * (t - pc_startup_start_s) / pc_startup_ramp_s) : 100)
+              << " phase=" << loop_stats.last_phase
+              << " hist=" << (loop_stats.history_ready ? 1 : 0)
               << " rl_fb=" << (rl_fallback_active ? 1 : 0);
     if (runtime_state == RuntimeState::DampingFault) {
       std::cout << " fault=\"" << fault_reason << "\"";
@@ -186,6 +190,9 @@ void emitStatus(
       sf << "\"obs_joint_age_ms\":"
          << (loop_stats.last_obs_joint_age_s >= 0.0
            ? static_cast<long long>(loop_stats.last_obs_joint_age_s * 1000.0) : -1) << ",";
+      sf << "\"policy_phase\":" << loop_stats.last_phase << ",";
+      sf << "\"history_ready\":" << (loop_stats.history_ready ? "true" : "false") << ",";
+      sf << "\"rl_episode\":" << (loop_stats.rl_episode_active ? "true" : "false") << ",";
       sf << "\"fault_reason\":\""
          << (runtime_state == RuntimeState::DampingFault ? escapeJson(fault_reason) : "")
          << "\",";

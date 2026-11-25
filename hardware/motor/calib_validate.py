@@ -58,7 +58,13 @@ REDUCTIONS = np.array([
 ])
 
 LOG_DIR = Path(__file__).resolve().parent / "calibration_logs"
-POLICY_PATH = Path(__file__).resolve().parent.parent.parent / "policy" / "opendoge_r5.onnx"
+# Legacy: this tool still targets the old 49-dim opendoge_r5.onnx. It is NOT
+# compatible with the current 47x5 SuperMimic policy; see
+# docs/opendoge_supermimic_migration.md.
+POLICY_PATH = (
+    Path(__file__).resolve().parent.parent.parent
+    / "policy" / "legacy_48dim" / "opendoge_r5.onnx"
+)
 
 
 def build_observation(

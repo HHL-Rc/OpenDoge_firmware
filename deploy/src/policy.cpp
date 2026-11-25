@@ -1,77 +1,57 @@
 #include "opendoge_deploy/policy.hpp"
 
 #include <algorithm>
-#include <fstream>
-#include <sstream>
+#include <cmath>
 
 namespace opendoge
 {
 namespace
 {
+
+PolicyInfo defaultPolicyInfo()
+{
+  PolicyInfo info;
+  info.valid = true;
+  info.observation_dim = kObsDim;
+  info.history_length = kObsHistoryLength;
+  info.action_dim = kNumJoints;
+  info.control_dt_s = kPolicyDt;
+  info.action_scale = {
+    0.25, 0.4, 0.4,  0.25, 0.4, 0.4,
+    0.25, 0.4, 0.4,  0.25, 0.4, 0.4};
+  info.default_joint_positions = {
+    0.0, 0.8, -1.6,  0.0, -0.8, 1.6,
+    0.0, 0.8, -1.6,  0.0, -0.8, 1.6};
+  info.joint_names = {
+    "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+    "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+    "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+    "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint"};
+  return info;
+}
+
 class NonePolicy final : public Policy
 {
 public:
-  bool load(const std::string &, std::string &) override { return true; }
-  bool infer(const std::array<double, kObsDim> &, std::array<double, kNumJoints> & action, std::string &) override
+  bool load(const std::string &, std::string &) override
+  {
+    info_ = defaultPolicyInfo();
+    return true;
+  }
+
+  bool infer(
+    const ObsHistory &,
+    std::array<double, kNumJoints> & action,
+    std::string &) override
   {
     action.fill(0.0);
     return true;
   }
-};
 
-class LinearCsvPolicy final : public Policy
-{
-public:
-  bool load(const std::string & path, std::string & error) override
-  {
-    std::ifstream file(path);
-    if (!file) {
-      error = "cannot open linear_csv policy: " + path;
-      return false;
-    }
-    weights_.clear();
-    std::string line;
-    while (std::getline(file, line)) {
-      if (line.empty() || line[0] == '#') {
-        continue;
-      }
-      std::vector<double> row;
-      std::stringstream ss(line);
-      std::string token;
-      while (std::getline(ss, token, ',')) {
-        if (!token.empty()) {
-          row.push_back(std::stod(token));
-        }
-      }
-      weights_.push_back(row);
-    }
-    if (weights_.size() != kNumJoints) {
-      error = "linear_csv must have 12 rows";
-      return false;
-    }
-    for (const auto & row : weights_) {
-      if (row.size() != kObsDim + 1) {
-        error = "linear_csv row must have obs_dim + bias columns";
-        return false;
-      }
-    }
-    return true;
-  }
-
-  bool infer(const std::array<double, kObsDim> & obs, std::array<double, kNumJoints> & action, std::string &) override
-  {
-    for (std::size_t out = 0; out < kNumJoints; ++out) {
-      double value = weights_[out].back();
-      for (std::size_t i = 0; i < kObsDim; ++i) {
-        value += weights_[out][i] * obs[i];
-      }
-      action[out] = std::clamp(value, -1.0, 1.0);
-    }
-    return true;
-  }
+  const PolicyInfo & info() const override { return info_; }
 
 private:
-  std::vector<std::vector<double>> weights_;
+  PolicyInfo info_{};
 };
 
 class MissingOnnxPolicy final : public Policy
@@ -82,12 +62,22 @@ public:
     error = "opendoge_deploy was built without ONNX Runtime";
     return false;
   }
-  bool infer(const std::array<double, kObsDim> &, std::array<double, kNumJoints> &, std::string & error) override
+
+  bool infer(
+    const ObsHistory &,
+    std::array<double, kNumJoints> &,
+    std::string & error) override
   {
     error = "ONNX backend unavailable";
     return false;
   }
+
+  const PolicyInfo & info() const override { return info_; }
+
+private:
+  PolicyInfo info_{};
 };
+
 }  // namespace
 
 std::unique_ptr<Policy> makeOnnxPolicy();
@@ -96,9 +86,6 @@ std::unique_ptr<Policy> makePolicy(const std::string & backend)
 {
   if (backend == "none") {
     return std::make_unique<NonePolicy>();
-  }
-  if (backend == "linear_csv") {
-    return std::make_unique<LinearCsvPolicy>();
   }
   if (backend == "onnx") {
 #ifdef OPENDOGE_HAS_ONNX

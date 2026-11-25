@@ -18,6 +18,12 @@ struct Options
   bool enable{false};
   bool clear_fault{false};
   bool start_active{false};
+  // Start directly in ActiveRL (implies start_active). Used for policy
+  // verification in dry-run and for supervised RL bring-up.
+  bool start_rl{false};
+  // Load the policy, validate its contract, run one deterministic inference,
+  // print the action and exit without touching CAN.
+  bool verify_policy{false};
   // Force low_gain_mode regardless of the command file (the joystick bridge
   // rewrites that file at ~100 Hz and would otherwise clear it).
   bool low_gain{false};
@@ -27,8 +33,6 @@ struct Options
   int rt_priority{60};
   double duration_s{0.0};
   std::string status_file;
-  // Overrides DeployConfig::lin_vel_source when non-empty.
-  std::string lin_vel_source;
   // Optional bring-up overrides (<0 = keep config value).
   double kp_override{-1.0};
   double kd_override{-1.0};

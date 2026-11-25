@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <memory>
 #include <sstream>
@@ -36,7 +37,7 @@ public:
       auto output_name = session_->GetOutputNameAllocated(0, allocator_);
       input_name_ = input_name.get();
       output_name_ = output_name.get();
-      if (!validateIo(error)) {
+      if (!validateIo(error) || !readMetadata(error)) {
         session_.reset();
         return false;
       }
@@ -47,18 +48,25 @@ public:
     return true;
   }
 
-  bool infer(const std::array<double, kObsDim> & obs, std::array<double, kNumJoints> & action, std::string & error) override
+  bool infer(
+    const ObsHistory & history,
+    std::array<double, kNumJoints> & action,
+    std::string & error) override
   {
     if (!session_) {
       error = "ONNX session is not loaded";
       return false;
     }
 
-    std::array<float, kObsDim> input{};
-    for (std::size_t i = 0; i < kObsDim; ++i) {
-      input[i] = static_cast<float>(obs[i]);
+    std::array<float, kObsHistoryDim> input{};
+    for (std::size_t i = 0; i < kObsHistoryDim; ++i) {
+      if (!std::isfinite(history[i])) {
+        error = "ONNX input contains NaN or Inf";
+        return false;
+      }
+      input[i] = static_cast<float>(history[i]);
     }
-    std::array<int64_t, 2> input_shape{1, static_cast<int64_t>(kObsDim)};
+    std::array<int64_t, 2> input_shape{1, static_cast<int64_t>(kObsHistoryDim)};
     auto tensor = Ort::Value::CreateTensor<float>(
       memory_info_, input.data(), input.size(), input_shape.data(), input_shape.size());
 
@@ -84,6 +92,8 @@ public:
     return true;
   }
 
+  const PolicyInfo & info() const override { return info_; }
+
 private:
   Ort::Env env_;
   Ort::SessionOptions session_options_;
@@ -92,6 +102,7 @@ private:
   std::unique_ptr<Ort::Session> session_;
   std::string input_name_;
   std::string output_name_;
+  PolicyInfo info_{};
 
   static std::string shapeString(const std::vector<int64_t> & shape)
   {
@@ -105,6 +116,121 @@ private:
     }
     ss << "]";
     return ss.str();
+  }
+
+  static std::string trim(const std::string & input)
+  {
+    const auto first = std::find_if_not(input.begin(), input.end(), [](unsigned char c) {
+      return std::isspace(c) != 0;
+    });
+    const auto last = std::find_if_not(input.rbegin(), input.rend(), [](unsigned char c) {
+      return std::isspace(c) != 0;
+    }).base();
+    return first >= last ? std::string{} : std::string(first, last);
+  }
+
+  static std::vector<double> parseNumberArray(const std::string & text)
+  {
+    std::vector<double> values;
+    std::string normalized = text;
+    for (char & c : normalized) {
+      if (c == '[' || c == ']' || c == ',') {
+        c = ' ';
+      }
+    }
+    std::stringstream ss(normalized);
+    double value = 0.0;
+    while (ss >> value) {
+      values.push_back(value);
+    }
+    return values;
+  }
+
+  static std::vector<std::string> parseStringArray(const std::string & text)
+  {
+    std::vector<std::string> values;
+    std::size_t position = 0;
+    while (true) {
+      const auto open = text.find('"', position);
+      if (open == std::string::npos) {
+        break;
+      }
+      const auto close = text.find('"', open + 1);
+      if (close == std::string::npos) {
+        break;
+      }
+      values.push_back(text.substr(open + 1, close - open - 1));
+      position = close + 1;
+    }
+    return values;
+  }
+
+  std::string metadata(const char * key)
+  {
+    auto value = session_->GetModelMetadata().LookupCustomMetadataMapAllocated(key, allocator_);
+    return value ? std::string(value.get()) : std::string{};
+  }
+
+  bool readMetadata(std::string & error)
+  {
+    const auto observation_dim = metadata("observation_dim");
+    const auto history_length = metadata("history_length");
+    const auto control_dt = metadata("control_dt_seconds");
+    const auto history_order = metadata("history_order");
+    const auto action_scales = metadata("action_scales");
+    const auto default_positions = metadata("default_joint_positions");
+    const auto joint_names = metadata("joint_names");
+    if (observation_dim.empty() || history_length.empty() || control_dt.empty() ||
+        history_order.empty() || action_scales.empty() || default_positions.empty() ||
+        joint_names.empty())
+    {
+      error = "ONNX metadata is missing the SuperMimic deployment contract";
+      return false;
+    }
+
+    try {
+      info_.observation_dim = static_cast<std::size_t>(std::stoul(observation_dim));
+      info_.history_length = static_cast<std::size_t>(std::stoul(history_length));
+      info_.control_dt_s = std::stod(control_dt);
+    } catch (const std::exception & exc) {
+      error = std::string("ONNX metadata parse failed: ") + exc.what();
+      return false;
+    }
+    info_.action_dim = kNumJoints;
+    if (info_.observation_dim != kObsDim || info_.history_length != kObsHistoryLength ||
+        std::abs(info_.control_dt_s - kPolicyDt) > 1.0e-6)
+    {
+      error = "ONNX metadata dimensions/timing do not match this deploy build";
+      return false;
+    }
+    std::string history_order_value = trim(history_order);
+    if (history_order_value.size() >= 2 &&
+        history_order_value.front() == '"' && history_order_value.back() == '"')
+    {
+      history_order_value =
+        history_order_value.substr(1, history_order_value.size() - 2);
+    }
+    if (history_order_value != "frame_major_oldest_first") {
+      error = "ONNX history_order must be frame_major_oldest_first, got " + history_order;
+      return false;
+    }
+
+    const auto scales = parseNumberArray(action_scales);
+    const auto defaults = parseNumberArray(default_positions);
+    const auto names = parseStringArray(joint_names);
+    if (scales.size() != kNumJoints || defaults.size() != kNumJoints ||
+        names.size() != kNumJoints)
+    {
+      error = "ONNX metadata arrays must each contain 12 entries";
+      return false;
+    }
+    for (std::size_t i = 0; i < kNumJoints; ++i) {
+      info_.action_scale[i] = scales[i];
+      info_.default_joint_positions[i] = defaults[i];
+      info_.joint_names[i] = names[i];
+    }
+    info_.valid = true;
+    return true;
   }
 
   bool validateIo(std::string & error)
@@ -126,11 +252,16 @@ private:
       error = "ONNX output must be float tensor";
       return false;
     }
-    if (input_shape.size() != 2 || input_shape[1] != static_cast<int64_t>(kObsDim)) {
-      error = "ONNX input shape must be [batch," + std::to_string(kObsDim) + "], got " + shapeString(input_shape);
+    if (input_shape.size() != 2 ||
+        input_shape[1] != static_cast<int64_t>(kObsHistoryDim))
+    {
+      error = "ONNX input shape must be [batch," + std::to_string(kObsHistoryDim) +
+        "], got " + shapeString(input_shape);
       return false;
     }
-    if (output_shape.size() != 2 || output_shape[1] != static_cast<int64_t>(kNumJoints)) {
+    if (output_shape.size() != 2 ||
+        output_shape[1] != static_cast<int64_t>(kNumJoints))
+    {
       error = "ONNX output shape must be [batch,12], got " + shapeString(output_shape);
       return false;
     }

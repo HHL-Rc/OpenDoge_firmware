@@ -3,6 +3,13 @@
 > 日期: 2026-10-19
 > 范围: `OpenDoge_firmware` 的 C++ 部署运行时、MuJoCo sim2sim、固件 XML、配置与回归测试
 > 训练侧: `/home/hhl/RC/LainLab` (mjlab 1.6.0 + RSL-RL PPO)
+>
+> ⚠️ **历史文档**：本文描述旧的 **48 维 LainLab** 策略。2026-11-17 起部署侧已迁移到
+> OpenDoge_train SuperMimic（47 维 × 5 帧、50 Hz、逐关节 action scale、仅 ActiveRL
+> 推理）。新契约、验证结果与风险见
+> [`opendoge_supermimic_migration.md`](opendoge_supermimic_migration.md)。本文保留作
+> 历史对照；其中 `buildObservation()`、`advancePhase()`、`lin_vel_source` 等接口
+> 已不存在。
 
 ---
 

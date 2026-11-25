@@ -21,6 +21,10 @@ struct LoopStats
   // not per-window counters: resetWindow() deliberately does not clear them.
   double last_obs_imu_age_s{-1.0};
   double last_obs_joint_age_s{-1.0};
+  // SuperMimic policy diagnostics (last inference tick).
+  double last_phase{0.0};
+  bool history_ready{false};
+  bool rl_episode_active{false};
 
   void resetWindow()
   {

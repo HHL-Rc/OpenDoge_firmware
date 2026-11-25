@@ -149,12 +149,40 @@ bool loadDeployConfig(
     config.kp = getDouble(values, "kp", config.kp);
     config.kd = getDouble(values, "kd", config.kd);
     config.safe_kd = getDouble(values, "safe_kd", config.safe_kd);
-    config.action_scale = getDouble(values, "action_scale", config.action_scale);
     {
-      const auto it = values.find("lin_vel_source");
-      if (it != values.end() && !it->second.empty()) {
-        config.lin_vel_source = it->second;
+      // OpenDoge_train action scales are per joint type. Keep the defaults
+      // (hip 0.25 / thigh 0.4 / calf 0.4) when the keys are absent.
+      const double hip = getDouble(values, "action_scale_hip", config.action_scale[0]);
+      const double thigh = getDouble(values, "action_scale_thigh", config.action_scale[1]);
+      const double calf = getDouble(values, "action_scale_calf", config.action_scale[2]);
+      for (std::size_t i = 0; i < kNumJoints; ++i) {
+        config.action_scale[i] = (i % 3 == 0) ? hip : (i % 3 == 1) ? thigh : calf;
       }
+      for (std::size_t i = 0; i < kNumJoints; ++i) {
+        if (!std::isfinite(config.action_scale[i]) || config.action_scale[i] <= 0.0) {
+          error = "action_scale_hip/thigh/calf must be finite and > 0";
+          return false;
+        }
+      }
+    }
+    config.gait_period_s = getDouble(values, "gait_period_s", config.gait_period_s);
+    config.gait_command_threshold = getDouble(
+      values, "gait_command_threshold", config.gait_command_threshold);
+    if (!std::isfinite(config.inference_hz) || config.inference_hz <= 0.0) {
+      error = "inference_hz must be finite and > 0";
+      return false;
+    }
+    if (std::abs(1.0 / config.inference_hz - kPolicyDt) > 1.0e-6) {
+      error = "inference_hz must match the policy control_dt_seconds=0.02 (50 Hz)";
+      return false;
+    }
+    if (!std::isfinite(config.gait_period_s) || config.gait_period_s <= 0.0) {
+      error = "gait_period_s must be finite and > 0";
+      return false;
+    }
+    if (!std::isfinite(config.gait_command_threshold) || config.gait_command_threshold < 0.0) {
+      error = "gait_command_threshold must be finite and >= 0";
+      return false;
     }
     config.state_timeout_s = getDouble(values, "state_timeout_s", config.state_timeout_s);
     config.feedback_retry_hz = getDouble(values, "feedback_retry_hz", config.feedback_retry_hz);
@@ -192,6 +220,26 @@ bool loadDeployConfig(
     config.torque_timeout_s = getDouble(values, "torque_timeout_s", config.torque_timeout_s);
     config.tracking_error_threshold = getDouble(values, "tracking_error_threshold", config.tracking_error_threshold);
     config.tracking_error_timeout_s = getDouble(values, "tracking_error_timeout_s", config.tracking_error_timeout_s);
+    config.rl_tracking_error_threshold = getDouble(
+      values, "rl_tracking_error_threshold", config.rl_tracking_error_threshold);
+    config.rl_tracking_error_timeout_s = getDouble(
+      values, "rl_tracking_error_timeout_s", config.rl_tracking_error_timeout_s);
+    config.rl_joint_limit_margin = getDouble(
+      values, "rl_joint_limit_margin", config.rl_joint_limit_margin);
+    if (!std::isfinite(config.rl_tracking_error_threshold) ||
+        config.rl_tracking_error_threshold <= 0.0 ||
+        !std::isfinite(config.rl_tracking_error_timeout_s) ||
+        config.rl_tracking_error_timeout_s <= 0.0)
+    {
+      error = "rl_tracking_error_threshold/timeout must be finite and > 0";
+      return false;
+    }
+    if (!std::isfinite(config.rl_joint_limit_margin) ||
+        config.rl_joint_limit_margin < 0.0)
+    {
+      error = "rl_joint_limit_margin must be finite and >= 0";
+      return false;
+    }
     config.command_timeout_s = getDouble(values, "command_timeout_s", config.command_timeout_s);
     config.fall_gravity_z_threshold = getDouble(values, "fall_gravity_z_threshold", config.fall_gravity_z_threshold);
     config.fall_timeout_s = getDouble(values, "fall_timeout_s", config.fall_timeout_s);

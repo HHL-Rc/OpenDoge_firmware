@@ -69,38 +69,40 @@ RR_hip_joint, RR_thigh_joint, RR_calf_joint
 
 ## 策略模型
 
-当前部署使用 **UniLab Round 26** 模型（`policy/opendoge_r26.onnx`）。
+当前部署使用 **OpenDoge_train SuperMimic Rough 20,000 轮** 模型
+（`policy/opendoge_supermimic_rough_20000.onnx`）。
 
 | 属性 | 值 |
 |------|-----|
-| 训练 | UniLab PPO, MuJoCo, OpenDogeJoystickFlat |
-| Best/Final reward | 143.08 / 113.03 |
-| 输入 | 49 维单帧 observation（全部可部署，无 privileged info） |
-| 输出 | 12 维 joint action |
-| 网络结构 | MLP 49→512→256→128→12 (ELU) |
-| 归一化 | 嵌入 ONNX (Sub+Div, 训练期 running mean/std) |
-| PD 增益 | Kp=20.0, Kd=0.3 |
-| Action scale | 0.50 |
-| 默认站姿 | FL/FR: [0, 0.5, -1.3], RL/RR: [0, 0.7, -1.3] (对齐训练 keyframe) |
+| 训练 | OpenDoge_train / mjlab，SuperMimic `moe_history` |
+| 输入 | `obs_history` `[batch,235]`（5 帧 × 47 维） |
+| 输出 | 12 维关节位置偏移 |
+| 控制周期 | 0.02 s（50 Hz） |
+| 动作缩放 | hip 0.25 / thigh 0.4 / calf 0.4 |
+| 默认站姿（固件系） | 四腿统一 `[0, 0.8, -1.6]` |
+| 策略类型 | 盲本体策略（无 `base_lin_vel`，内部 MoE 历史编码器估计速度） |
 
-### Observation 格式（49 维）
+### Observation 格式（47 维 × 5 帧）
 
 ```
-gyro(3) + neg_gravity(3) + dof_pos_delta(12) + dof_vel(12)
-+ last_action(12) + commands(3) + feet_phase(4)
+base_ang_vel(3) + projected_gravity(3)
++ joint_pos_rel(12) + joint_vel_rel(12) + last_action(12)
++ command(3) + gait_phase_sin_cos(2) = 47
 ```
 
 | 分量 | 索引 | 说明 |
 |------|------|------|
-| gyro | 0:3 | IMU 角速度 (rad/s) |
-| neg_gravity | 3:6 | IMU 投影重力方向 (已取反 = -upvector) |
-| dof_pos_delta | 6:18 | 关节位置 − default_angles |
-| dof_vel | 18:30 | 关节速度 (rad/s) |
-| last_action | 30:42 | 上一帧策略输出 |
-| commands | 42:45 | vx, vy, v (原始值) |
-| feet_phase | 45:49 | 自适应步态相位 (FL, FR, RL, RR) |
+| base_ang_vel | 0:3 | IMU 角速度 (rad/s) |
+| projected_gravity | 3:6 | 机体系重力方向 (竖直时 `[0,0,-1]`) |
+| joint_pos_rel | 6:18 | 关节位置 − default（经 `kJointSign`） |
+| joint_vel_rel | 18:30 | 关节速度（经 `kJointSign`） |
+| last_action | 30:42 | 上一帧原始策略输出（不裁剪） |
+| command | 42:45 | vx, vy, yaw_rate |
+| gait_phase | 45:47 | `sin/cos`，站立时为零 |
 
-> **关键设计**：linvel（局部线速度）从 actor 观测中移除。训练采用非对称 actor-critic — critic 保留 privileged linvel 做值估计，actor 只依赖实机可获取的 49 维观测。这消除了 sim2real 的根本性 gap。
+5 帧历史按**旧→新**扁平化为 235 维；进入 `ActiveRL` 时重复当前帧 5 次。
+策略仅在 `ActiveRL` 运行；`ActivePC` 保持默认站姿。
+详见 `docs/opendoge_supermimic_migration.md`。
 
 ### 命令输入
 
@@ -197,7 +199,7 @@ python3 hardware/imu/dm_imu_bridge.py \
 运行 ONNX 策略时显式传入模型路径：
 
 ```bash
-POLICY_PATH=policy/opendoge_r26.onnx \
+POLICY_PATH=policy/opendoge_supermimic_rough_20000.onnx \
   ./scripts/start_robot.sh policy
 ```
 
@@ -240,7 +242,7 @@ python3 hardware/imu/dm_imu_bridge.py \
 # 终端 2: 运行 ONNX 推理 dry-run
 ./install/opendoge_deploy/bin/opendoge_deploy \
   --policy-backend onnx \
-  --policy-path policy/opendoge_r26.onnx \
+  --policy-path policy/opendoge_supermimic_rough_20000.onnx \
   --imu-file /tmp/opendoge_imu_test.state \
   --start-active --cmd 0.1 0.0 0.0 \
   --duration-sec 2
@@ -288,7 +290,7 @@ ONNX 策略实机运行：
 ./install/opendoge_deploy/bin/opendoge_deploy \
   --real --enable \
   --policy-backend onnx \
-  --policy-path policy/opendoge_r26.onnx \
+  --policy-path policy/opendoge_supermimic_rough_20000.onnx \
   --imu-file /tmp/opendoge_imu.state \
   --command-file /tmp/opendoge_command.state
 ```
@@ -322,7 +324,7 @@ Xbox 兼容手柄可以通过 joystick bridge 写入同一个命令文件：
 
 ./install/opendoge_deploy/bin/opendoge_deploy \
   --policy-backend onnx \
-  --policy-path policy/opendoge_r26.onnx \
+  --policy-path policy/opendoge_supermimic_rough_20000.onnx \
   --command-file /tmp/opendoge_command.state \
   --imu-file /tmp/opendoge_imu.state
 ```

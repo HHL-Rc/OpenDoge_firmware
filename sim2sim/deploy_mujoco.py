@@ -12,32 +12,33 @@ deploy_mujoco.py — OpenDoge MuJoCo 仿真测试
   - 12 关节顺序：FL_hip, FL_thigh, FL_calf, FR_hip, FR_thigh, FR_calf,
                   RL_hip, RL_thigh, RL_calf, RR_hip, RR_thigh, RR_calf
   - 默认姿态：每腿 {0, 0.8, -1.6} (固件 URDF 约定)
-  - PD 增益：kp=12, kd=0.5, safe_kd=2.0 (LainLab BuiltinPositionActuator)
-  - 动作缩放：action_scale=0.25
-  - 观测：48 维 LainLab actor obs (含 base_lin_vel)
+  - PD 增益：kp=12, kd=0.5, safe_kd=2.0 (OpenDoge_train BuiltinPositionActuator)
+  - 动作缩放：hip 0.25 / thigh 0.4 / calf 0.4
+  - 观测：47 维 × 5 帧 = 235（OpenDoge_train SuperMimic，无 base_lin_vel）
+  - 控制：策略 50 Hz，target/PD 200 Hz
   - 斜坡时长：pc_startup_ramp_s=2.0
 
 用法:
-  纯虚拟仿真手柄操作
   cd Lain_Code/sim2sim
-  python3 deploy_mujoco.py --joystick \
-  --model ../../LainLab/src/assets/robots/opendoge/xmls/scene_opendoge.xml \
-  --joint-convention training \
-  --policy ../../LainLab/src/baseline/opendoge/flat/policy.onnx \
-  --mode idle
-  不填写参数 --model 需要填写为 ../../LainLab/src/assets/robots/opendoge/xmls/scene_opendoge.xml
-            不填写则会出错，因为默认使用了 项目根目录下存在的scene.xml 详细可以看find_model_path函数的定义
-            **如果要进行scene.xml的更改需要进行多个xml和stl的移植，较为麻烦这里建议显示指定xml**
-           --mode 默认为 idle 趴伏状态
-           --policy 默认为 ../../LainLab/src/baseline/opendoge/flat/policy.onnx 最新的策略
-           --joystick/--keyboard 操作方式 有键盘和手柄 默认为手柄
-           --joint-convention training 不填默认为固件机械限位，填写时为LainLab下的URDF映射固件限位
+  python3 deploy_mujoco.py \
+    --training-root ../../OpenDoge_train \
+    --start-pose default --mode rl \
+    --policy ../policy/opendoge_supermimic_rough_20000.onnx \
+    --cmd 0.4 0 0 --duration 10
+  或者
+    python3 deploy_mujoco.py \
+    --training-root ../../OpenDoge_train \
+    --start-pose default --mode rl \
+    --policy ../policy/opendoge_supermimic_rough_20000.onnx \
+    --joystick
+  joystick需要显式指定不然不填写不会使用手柄为默认操作
+  --mode 可以不填
   
-  旧版指令 还保留了旧版policy 核心代码已经更改 只能做test里的测试
-  python3 deploy_mujoco.py --policy policy/opendoge_flat.onnx  # idle 起步, 手动走完整流程
-  python3 deploy_mujoco.py --mode rl --policy policy/opendoge_flat.onnx  # 直接进入 RL
-  python3 deploy_mujoco.py --joystick --policy policy/opendoge_flat.onnx  # 手柄控制
-  python3 deploy_mujoco.py --no-render --duration 10          # headless 测试
+  --training-root 默认自动查找同级 ../OpenDoge_train；
+  --joint-convention 默认 training（训练 XML，镜像轴、无执行器）；
+  --terrain flat|rough|stairs|boxes|slope 选择地形；
+  --joystick 使用 /dev/input/js* 手柄。
+  旧 48 维模型不兼容当前脚本，归档在 policy/legacy_48dim/。
 
 完整手动流程 (键盘):
   idle (Ready 趴伏) → A/空格 → EnteringPosition → ActivePC (站立)
@@ -57,6 +58,7 @@ deploy_mujoco.py — OpenDoge MuJoCo 仿真测试
 """
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -111,7 +113,20 @@ except Exception as _joy_exc:  # pragma: no cover - 仅缺少文件时触发
 # ══════════════════════════════════════════════════════════════════════
 
 NUM_JOINTS = 12
-OBS_DIM = 48
+OBS_DIM = 47
+HISTORY = 5
+POLICY_INPUT = OBS_DIM * HISTORY  # 235
+POLICY_HZ = 50.0
+CONTROL_DT = 1.0 / POLICY_HZ
+GAIT_PERIOD = 0.5
+GAIT_STEPS = 25  # round(GAIT_PERIOD / CONTROL_DT)
+GAIT_THRESHOLD = 0.1
+
+# OpenDoge_train action scales, per joint type (hip/thigh/calf × 4 legs).
+ACTION_SCALE = np.array([0.25, 0.4, 0.4] * 4, dtype=float)
+
+# Training actuator effort limits (joint side, N·m).
+MAX_JOINT_TORQUE = np.array([6.0, 6.0, 9.0] * 4, dtype=float)
 
 JOINT_NAMES = [
     "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
@@ -212,13 +227,18 @@ class RuntimeState(Enum):
 
 @dataclass
 class DeployConfig:
-    inference_hz: float = 100.0
+    inference_hz: float = POLICY_HZ
     target_hz: float = 200.0
     control_hz: float = 1000.0
-    kp: float = 12.0  # LainLab BuiltinPositionActuatorCfg.stiffness
-    kd: float = 0.5   # LainLab BuiltinPositionActuatorCfg.damping
+    kp: float = 12.0  # OpenDoge_train BuiltinPositionActuatorCfg.stiffness
+    kd: float = 0.5   # OpenDoge_train BuiltinPositionActuatorCfg.damping
     safe_kd: float = 2.0
-    action_scale: float = 0.25
+    action_scale: np.ndarray = field(default_factory=lambda: ACTION_SCALE.copy())
+    gait_period_s: float = GAIT_PERIOD
+    gait_command_threshold: float = GAIT_THRESHOLD
+    # Keep the ActiveRL target this far inside the joint range (mirrors the
+    # C++ rl_joint_limit_margin). 0 = training-exact target.
+    rl_joint_limit_margin: float = 0.03
     pc_startup_ramp_s: float = 2.0
     pc_startup_max_deviation: float = 2.0  # MuJoCo 从 REST_POSE (~2 rad from stand) 启动，需大容差。硬件侧为 0.25 (C++ config)
     standup_duration_s: float = 4.0       # 趴伏/远离站姿起身时长
@@ -232,7 +252,6 @@ class DeployConfig:
     loss_burst_ms: float = 0.0
     loss_target: str = "joint"  # joint|bus|all
     cmd_loss: float = 0.0
-    lin_vel_mode: str = "true"  # true|zero|command|noisy — base_lin_vel 消融
 
 
 @dataclass
@@ -264,57 +283,99 @@ def rate_limit(desired: float, previous: float, max_step: float) -> float:
     return previous + np.clip(desired - previous, -max_step, max_step)
 
 
-def advance_phase(command: OperatorCommand, phase: float, dt: float) -> float:
-    """自适应步态相位 — 与 main.cpp advancePhase() 一致"""
-    cmd_speed = math.sqrt(command.vx**2 + command.vy**2 + command.yaw_rate**2)
-    freq = np.clip(1.2 + 1.3 * cmd_speed / 0.6, 1.2, 2.5)
-    return math.fmod(phase + dt * freq, 1.0)
+def gait_phase_features(
+    elapsed_s: float,
+    command: OperatorCommand,
+    control_dt: float = CONTROL_DT,
+    period_s: float = GAIT_PERIOD,
+    threshold: float = GAIT_THRESHOLD,
+) -> np.ndarray:
+    """OpenDoge_train gait phase observation (matches observer.cpp).
+
+    The clock is episode-elapsed-time based and is NOT reset by the standing
+    gate; it is reset when the deployment enters ActiveRL.
+    """
+    dt = max(control_dt, 1.0e-6)
+    period = max(period_s, 1.0e-6)
+    period_steps = max(1, int(round(period / dt)))
+    steps = int(round(max(0.0, elapsed_s) / dt))
+    phase = (steps % period_steps) / period_steps
+    moving = math.hypot(command.vx, command.vy) + abs(command.yaw_rate) > threshold
+    if not moving:
+        return np.zeros(2)
+    angle = 2.0 * math.pi * phase
+    return np.array([math.sin(angle), math.cos(angle)])
 
 
-def build_observation(
+def build_observation_frame(
     joint_positions: np.ndarray,
     joint_velocities: np.ndarray,
     default_pos: np.ndarray,
     last_action: np.ndarray,
     command: OperatorCommand,
     imu: ImuSample,
+    phase_features: np.ndarray,
 ) -> np.ndarray:
-    """构建 48 维观测 — 与 main.cpp buildObservation() 一致。
+    """Build one 47-dim OpenDoge_train SuperMimic actor frame.
 
-    joint_positions/joint_velocities/default_pos 为固件 URDF 约定；
-    观测中的关节项通过 JOINT_SIGN 转换到 LainLab 训练约定。
+    joint_positions/joint_velocities/default_pos are in firmware URDF
+    convention; joint terms are mapped to the training convention with
+    JOINT_SIGN. There is no base_lin_vel: the policy is blind.
     """
     obs = np.zeros(OBS_DIM)
     offset = 0
 
-    # 1. base_lin_vel (3)
-    obs[offset:offset+3] = imu.linear_velocity
-    offset += 3
-
-    # 2. base_ang_vel (3)
+    # 1. base_ang_vel (3)
     obs[offset:offset+3] = imu.angular_velocity
     offset += 3
 
-    # 3. projected_gravity (3)
+    # 2. projected_gravity (3)
     obs[offset:offset+3] = imu.projected_gravity
     offset += 3
 
-    # 4. joint_pos_rel (12) — training convention
+    # 3. joint_pos_rel (12) — training convention
     obs[offset:offset+NUM_JOINTS] = JOINT_SIGN * (joint_positions - default_pos)
     offset += NUM_JOINTS
 
-    # 5. joint_vel_rel (12) — raw velocity, training convention
+    # 4. joint_vel_rel (12) — raw velocity, training convention
     obs[offset:offset+NUM_JOINTS] = JOINT_SIGN * joint_velocities
     offset += NUM_JOINTS
 
-    # 6. last_action (12) — raw policy output, no clipping
+    # 5. last_action (12) — raw policy output, no clipping
     obs[offset:offset+NUM_JOINTS] = last_action
     offset += NUM_JOINTS
 
-    # 7. command (3)
+    # 6. command (3)
     obs[offset:offset+3] = [command.vx, command.vy, command.yaw_rate]
+    offset += 3
+
+    # 7. gait phase sin/cos (2)
+    obs[offset:offset+2] = phase_features
 
     return obs
+
+
+class HistoryBuffer:
+    """Five-frame, oldest-first history (ONNX history_order)."""
+
+    def __init__(self):
+        self.frames = np.zeros((HISTORY, OBS_DIM))
+        self.ready = False
+
+    def reset(self, frame: np.ndarray) -> None:
+        self.frames[:] = frame
+        self.ready = True
+
+    def append(self, frame: np.ndarray) -> None:
+        self.frames[:-1] = self.frames[1:]
+        self.frames[-1] = frame
+        self.ready = True
+
+    def flatten(self) -> np.ndarray:
+        return self.frames.reshape(-1)
+
+    def clear(self) -> None:
+        self.ready = False
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -380,6 +441,8 @@ class OpenDogeSimulator:
         # 显式积分发散 (ω·dt > 2)。
         if joint_convention == "training" and not self._has_actuators:
             self.model.dof_armature[self._dof_adr] = 0.005
+        if joint_convention == "training":
+            self._apply_training_physics()
 
         # 传感器地址：必须用 sensor_adr（sensordata 偏移），不能用 sensor id。
         # 多分量传感器会让 id 与 adr 不同。
@@ -414,6 +477,33 @@ class OpenDogeSimulator:
 
         self.step_count = 0
 
+    def _apply_training_physics(self) -> None:
+        """Align the bare MuJoCo model with mjlab's runtime physics.
+
+        The training XML intentionally has no actuators and no runtime contact
+        overrides; mjlab applies timestep=0.005, armature=0.005, foot
+        condim/friction/solref and effort limits at load time. Without these
+        the policy is evaluated on a different plant than it was trained on.
+        """
+        self.model.opt.timestep = 0.005
+        self.model.opt.iterations = 10
+        self.model.opt.ls_iterations = 20
+        self.model.opt.ccd_iterations = 50
+        self.model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
+        self.model.opt.impratio = 1.0
+
+        for geom_id in range(self.model.ngeom):
+            name = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, geom_id
+            ) or ""
+            if "foot_collision" in name:
+                self.model.geom_condim[geom_id] = 3
+                self.model.geom_priority[geom_id] = 1
+                self.model.geom_friction[geom_id] = [1.0, 0.005, 0.0005]
+                self.model.geom_solref[geom_id] = [0.01, 1.0]
+            elif "collision" in name:
+                self.model.geom_condim[geom_id] = 1
+
     def get_joint_positions(self) -> np.ndarray:
         """读取 12 个关节位置 (rad), 返回固件约定 — 使用 jnt_qposadr"""
         q = np.zeros(NUM_JOINTS)
@@ -441,6 +531,8 @@ class OpenDogeSimulator:
         q = self.get_joint_positions()
         dq = self.get_joint_velocities()
         torque = kp_gains * (targets - q) - kd_gains * dq
+        if self.joint_convention == "training":
+            torque = np.clip(torque, -MAX_JOINT_TORQUE, MAX_JOINT_TORQUE)
         for i in range(NUM_JOINTS):
             tau_model = self._model_sign[i] * torque[i]
             if self._has_actuators:
@@ -572,7 +664,7 @@ class MockPolicy:
         if self.failure_rate > 0 and np.random.random() < self.failure_rate:
             return False, np.zeros(NUM_JOINTS), "mock: simulated inference failure"
 
-        t = self.call_count * 0.01  # 100 Hz
+        t = self.call_count * CONTROL_DT  # 50 Hz
         action = np.zeros(NUM_JOINTS)
         for leg_idx in range(4):
             hip_idx = leg_idx * 3
@@ -592,14 +684,102 @@ class OnnxPolicy:
             model_path,
             providers=["CPUExecutionProvider"],
         )
+        self._input_name = self._session.get_inputs()[0].name
+        self._output_name = self._session.get_outputs()[0].name
+        self._validate_contract(model_path)
         self.call_count = 0
 
-    def infer(self, obs: np.ndarray) -> Tuple[bool, np.ndarray, str]:
+    def _validate_contract(self, model_path: str) -> None:
+        inputs = self._session.get_inputs()
+        outputs = self._session.get_outputs()
+        if len(inputs) != 1 or len(outputs) != 1:
+            raise ValueError(
+                f"{model_path}: expected one input and one output, "
+                f"got {len(inputs)} and {len(outputs)}"
+            )
+        input_shape = inputs[0].shape
+        output_shape = outputs[0].shape
+        if len(input_shape) != 2 or input_shape[1] != POLICY_INPUT:
+            raise ValueError(
+                f"{model_path}: ONNX input shape must be [batch,{POLICY_INPUT}], "
+                f"got {input_shape}"
+            )
+        if len(output_shape) != 2 or output_shape[1] != NUM_JOINTS:
+            raise ValueError(
+                f"{model_path}: ONNX output shape must be [batch,{NUM_JOINTS}], "
+                f"got {output_shape}"
+            )
+
+        raw_meta = self._session.get_modelmeta().custom_metadata_map
+        try:
+            meta = {key: json.loads(value) for key, value in raw_meta.items()}
+        except Exception as exc:
+            raise ValueError(f"{model_path}: cannot parse ONNX metadata: {exc}") from exc
+
+        required = (
+            "observation_dim", "history_length", "control_dt_seconds",
+            "history_order", "action_scales", "default_joint_positions",
+            "joint_names",
+        )
+        missing = [key for key in required if key not in meta]
+        if missing:
+            raise ValueError(
+                f"{model_path}: ONNX metadata missing {missing}; "
+                "this is not an OpenDoge_train SuperMimic policy"
+            )
+        if meta["observation_dim"] != OBS_DIM:
+            raise ValueError(
+                f"{model_path}: observation_dim={meta['observation_dim']} != {OBS_DIM}"
+            )
+        if meta["history_length"] != HISTORY:
+            raise ValueError(
+                f"{model_path}: history_length={meta['history_length']} != {HISTORY}"
+            )
+        if abs(meta["control_dt_seconds"] - CONTROL_DT) > 1e-9:
+            raise ValueError(
+                f"{model_path}: control_dt_seconds={meta['control_dt_seconds']} "
+                f"!= {CONTROL_DT}"
+            )
+        if meta["history_order"] != "frame_major_oldest_first":
+            raise ValueError(
+                f"{model_path}: history_order={meta['history_order']!r} "
+                "must be 'frame_major_oldest_first'"
+            )
+        scales = np.asarray(meta["action_scales"], dtype=float)
+        if scales.shape != (NUM_JOINTS,) or not np.allclose(scales, ACTION_SCALE):
+            raise ValueError(
+                f"{model_path}: action_scales mismatch: {scales.tolist()} "
+                f"!= {ACTION_SCALE.tolist()}"
+            )
+        default_train = np.array([
+            0.0, 0.8, -1.6,  0.0, -0.8, 1.6,
+            0.0, 0.8, -1.6,  0.0, -0.8, 1.6,
+        ])
+        defaults = np.asarray(meta["default_joint_positions"], dtype=float)
+        if defaults.shape != (NUM_JOINTS,) or not np.allclose(defaults, default_train):
+            raise ValueError(
+                f"{model_path}: default_joint_positions mismatch: "
+                f"{defaults.tolist()} != {default_train.tolist()}"
+            )
+        if list(meta["joint_names"]) != JOINT_NAMES:
+            raise ValueError(
+                f"{model_path}: joint_names mismatch: {meta['joint_names']}"
+            )
+        self.metadata = meta
+        print(
+            f"[POLICY] {model_path}: obs={meta['observation_dim']} "
+            f"history={meta['history_length']} dt={meta['control_dt_seconds']} "
+            f"action_scale={scales.tolist()}"
+        )
+
+    def infer(self, history: np.ndarray) -> Tuple[bool, np.ndarray, str]:
         """ONNX 推理。返回 (success, action, error_msg)"""
         self.call_count += 1
         try:
-            input_feed = {"obs": obs.astype(np.float32).reshape(1, -1)}
-            action = self._session.run(None, input_feed)[0]
+            input_feed = {
+                self._input_name: history.astype(np.float32).reshape(1, -1)
+            }
+            action = self._session.run([self._output_name], input_feed)[0]
             return True, action.flatten(), ""
         except Exception as e:
             return False, np.zeros(NUM_JOINTS), f"ONNX inference error: {e}"
@@ -748,17 +928,17 @@ class JoystickHandler:
         axis_vx: int = 1,
         axis_vy: int = 0,
         axis_yaw: int = 2,
-        # 默认匹配 Zikway HID gamepad (3537:1041):
-        #   A=0 B=1 X=3 Y=4, START=LB(6), BACK=RB(7)
-        # 该手柄没有独立 START 键；Home=btn12，但长按会关机，故默认用 LB 代替。
-        # 如需改用 Home，将下面 btn_start 改为 12（或传 --joy-btn-start 12）:
-        # btn_start: int = 12,  # Home
+        # BEITONG BTP-KP70C (20bc:5174) native js0 defaults:
+        #   A=0 B=1 X=3 Y=4; left stick axes 1/0, right stick X axis 2.
+        # Back/Start are optional: M6=btn13 (low_gain), M5=btn14 (enable).
+        # They are left unassigned by default; pass --joy-btn-back/--joy-btn-start
+        # if you want the physical M5/M6 buttons.
         btn_a: int = 0,
         btn_b: int = 1,
         btn_x: int = 3,
         btn_y: int = 4,
-        btn_back: int = 7,
-        btn_start: int = 6,
+        btn_back: Optional[int] = None,
+        btn_start: Optional[int] = None,
         debug: bool = False,
     ):
         if not HAS_JOYSTICK:
@@ -916,7 +1096,6 @@ class DeployController:
         static_vy: float = 0.0,
         static_yaw: float = 0.0,
         logger: Optional["DeployLogger"] = None,
-        lin_vel_mode: Optional[str] = None,
         seed: int = 0,
     ):
         self.sim = sim
@@ -927,12 +1106,6 @@ class DeployController:
         self.static_vy = static_vy
         self.static_yaw = static_yaw
         self.logger = logger
-        self.lin_vel_mode = lin_vel_mode or config.lin_vel_mode
-        if self.lin_vel_mode not in ("true", "zero", "command", "noisy"):
-            raise ValueError(
-                "lin_vel_mode must be one of true|zero|command|noisy, "
-                f"got {self.lin_vel_mode!r}"
-            )
         self._rng = np.random.default_rng(seed)
         # Sensor history / loss state for --imu-delay-ms/--joint-delay-ms/
         # --packet-loss/--cmd-loss. The history is observation-only.
@@ -953,6 +1126,10 @@ class DeployController:
 
         # 控制变量
         self.phase = 0.0
+        self.phase_features = np.zeros(2)
+        self.history = HistoryBuffer()
+        self.history_ready = False
+        self.rl_start_s = -1.0
         self.action = np.zeros(NUM_JOINTS)
         self.last_action = np.zeros(NUM_JOINTS)
         self.logical_target = DEFAULT_POS.copy()
@@ -973,19 +1150,46 @@ class DeployController:
             cmd.position_control = False
         return cmd
 
-    def _resolve_linear_velocity(
-        self, true_lin_vel: np.ndarray, command: OperatorCommand
-    ) -> np.ndarray:
-        """按消融模式生成策略观测中的 base_lin_vel。"""
-        if self.lin_vel_mode == "true":
-            return true_lin_vel
-        if self.lin_vel_mode == "zero":
-            return np.zeros(3)
-        if self.lin_vel_mode == "command":
-            # 体坐标系下的期望速度 (yaw 不贡献线速度)
-            return np.array([command.vx, command.vy, 0.0])
-        # noisy: true velocity + 训练时的 U(-0.5, 0.5) m/s 噪声
-        return true_lin_vel + self._rng.uniform(-0.5, 0.5, 3)
+    def reset_after_fall(self, t: float) -> None:
+        """Reset the plant and start a fresh ActiveRL episode (used by --auto-reset)."""
+        self.sim.reset_to_default_pose()
+        # Keep simulation time continuous so --duration semantics stay intact.
+        self.sim.data.time = t
+        mujoco.mj_forward(self.sim.model, self.sim.data)
+        command = self._get_command()
+        self.fault_latched = False
+        self.fault_reason = ""
+        self.rl_fallback_active = False
+        self.action.fill(0.0)
+        self.last_action.fill(0.0)
+        self.logical_target = DEFAULT_POS.copy()
+        self.limited_target = DEFAULT_POS.copy()
+        self.phase = 0.0
+        self.phase_features = np.zeros(2)
+        self.history.clear()
+        self.history_ready = False
+        self.rl_start_s = -1.0
+        self.standup_handover_start_s = -1.0
+        self._last_infer_tick = -1
+        self._last_target_tick = -1
+        self._sensor_history.clear()
+        if command.active and command.rl_inference:
+            self.runtime_state = RuntimeState.ActiveRL
+            self.rl_start_s = t
+            self.standup_handover_start_s = t
+            frame0 = build_observation_frame(
+                self.sim.get_joint_positions(),
+                self.sim.get_joint_velocities(),
+                DEFAULT_POS,
+                self.last_action,
+                command,
+                self.sim.get_imu(),
+                np.zeros(2),
+            )
+            self.history.reset(frame0)
+            self.history_ready = True
+        else:
+            self.runtime_state = RuntimeState.Ready
 
     def _delayed_snapshot(self, t: float, delay_s: float):
         """Return the newest history entry at or before t-delay_s.
@@ -1038,6 +1242,7 @@ class DeployController:
         """执行一个控制周期。返回 True 继续，False 退出。"""
         t = self.sim.data.time
         config = self.config
+        prev_state = self.runtime_state
         # Observation-only sensor history (used by the delay model). Filled
         # every controller step so the delay resolution is the sim timestep.
         self._sensor_history.append((
@@ -1159,16 +1364,50 @@ class DeployController:
                 self.rl_fallback_active = False
                 print(f"\n[{t:.3f}s] ActiveRL → ActivePC")
 
-        # --- 推理块 (100 Hz, 与 C++ main.cpp 一致: 所有 active 状态均运行推理) ---
-        infer_tick = int(t * config.inference_hz)
+        # ── ActiveRL episode boundary (mirrors main.cpp) ──
+        entered_rl = (
+            prev_state != RuntimeState.ActiveRL
+            and self.runtime_state == RuntimeState.ActiveRL
+        )
+        if entered_rl:
+            self.rl_start_s = t
+            self.standup_handover_start_s = t
+            self.action.fill(0.0)
+            self.last_action.fill(0.0)
+            frame0 = build_observation_frame(
+                self.sim.get_joint_positions(),
+                self.sim.get_joint_velocities(),
+                DEFAULT_POS,
+                self.last_action,
+                command,
+                self.sim.get_imu(),
+                np.zeros(2),
+            )
+            self.history.reset(frame0)
+            self.history_ready = True
+            self.phase = 0.0
+            print(f"\n[{t:.3f}s] ActiveRL episode reset (5-frame history, phase=0)")
+        left_rl = (
+            prev_state == RuntimeState.ActiveRL
+            and self.runtime_state != RuntimeState.ActiveRL
+        )
+        if left_rl:
+            self.rl_start_s = -1.0
+            self.history_ready = False
+            self.history.clear()
+            self.action.fill(0.0)
+            self.last_action.fill(0.0)
+            self.standup_handover_start_s = -1.0
+
+        # --- 推理块 (50 Hz, ActiveRL only) ---
+        infer_tick = int(t * config.inference_hz + 1.0e-9)
         if infer_tick != self._last_infer_tick:
             self._last_infer_tick = infer_tick
             if (
-                self.runtime_state in (RuntimeState.ActiveRL, RuntimeState.EnteringPosition, RuntimeState.ActivePC)
+                self.runtime_state == RuntimeState.ActiveRL
                 and command.active
                 and self.policy is not None
             ):
-                self.phase = advance_phase(command, self.phase, 1.0 / config.inference_hz)
                 imu = self.sim.get_imu()
                 q_obs = self.sim.get_joint_positions()
                 dq_obs = self.sim.get_joint_velocities()
@@ -1199,31 +1438,46 @@ class DeployController:
                         else:
                             self._loss_hold_q[i] = q_obs[i]
                             self._loss_hold_dq[i] = dq_obs[i]
-                imu.linear_velocity = self._resolve_linear_velocity(
-                    imu.linear_velocity, command
-                )
-                obs = build_observation(
-                    q_obs,
-                    dq_obs,
-                    DEFAULT_POS,
-                    self.last_action,
+
+                elapsed = max(0.0, t - self.rl_start_s)
+                steps = int(round(elapsed / max(1.0 / config.inference_hz, 1e-6)))
+                period_steps = max(1, int(round(config.gait_period_s * config.inference_hz)))
+                self.phase = (steps % period_steps) / period_steps
+                phase_features = gait_phase_features(
+                    elapsed,
                     command,
-                    imu,
+                    1.0 / config.inference_hz,
+                    config.gait_period_s,
+                    config.gait_command_threshold,
                 )
-                success, action, error = self.policy.infer(obs)
-                if not success:
-                    if self.runtime_state == RuntimeState.ActiveRL:
+                if not self.history_ready:
+                    # Rebuild after a skipped tick; do not infer on a
+                    # non-time-regular history.
+                    frame0 = build_observation_frame(
+                        q_obs, dq_obs, DEFAULT_POS, self.last_action,
+                        command, imu, np.zeros(2),
+                    )
+                    self.history.reset(frame0)
+                    self.history_ready = True
+                    self.rl_start_s = t
+                    self.action.fill(0.0)
+                else:
+                    frame = build_observation_frame(
+                        q_obs, dq_obs, DEFAULT_POS, self.last_action,
+                        command, imu, phase_features,
+                    )
+                    self.history.append(frame)
+                    success, action, error = self.policy.infer(self.history.flatten())
+                    if not success:
                         self.runtime_state = RuntimeState.ActivePC
                         self.rl_fallback_active = True
+                        self.history_ready = False
+                        self.history.clear()
                         self.action.fill(0.0)
+                        self.last_action.fill(0.0)
                         print(f"\n[{t:.3f}s] RL 推理失败 → ActivePC (降级): {error}")
                     else:
-                        self.fault_latched = True
-                        self.fault_reason = f"policy inference failed: {error}"
-                        self.runtime_state = RuntimeState.DampingFault
-                        print(f"\n[{t:.3f}s] 故障: {self.fault_reason}")
-                else:
-                    self.action = action
+                        self.action = action
             else:
                 self.action.fill(0.0)
 
@@ -1231,10 +1485,10 @@ class DeployController:
         target_tick = int(t * config.target_hz)
         if target_tick != self._last_target_tick:
             self._last_target_tick = target_tick
-            # 起身交接：第一帧策略动作可能很大，先从默认姿态淡入，
+            # 进入 ActiveRL 的交接淡入：第一帧策略动作可能很大，先从默认姿态淡入，
             # 避免 calf 目标瞬跳（与 controller.cpp updateTargets 一致）。
             handover = (
-                self.runtime_state in (RuntimeState.ActiveRL, RuntimeState.ActivePC)
+                self.runtime_state == RuntimeState.ActiveRL
                 and self.standup_handover_start_s >= 0.0
                 and t - self.standup_handover_start_s < config.standup_handover_s
             )
@@ -1246,15 +1500,24 @@ class DeployController:
                     1.0,
                 )
             for i in range(NUM_JOINTS):
-                # 训练无裁剪；last_action 观测原始策略输出
-                self.last_action[i] = self.action[i]
-                if self.runtime_state in (RuntimeState.LowGainTest, RuntimeState.StandingUp):
-                    tgt = DEFAULT_POS[i]
-                else:
-                    # 动作在训练约定，映射回固件约定
+                if self.runtime_state == RuntimeState.ActiveRL:
+                    # 训练无裁剪；last_action 观测原始策略输出
+                    self.last_action[i] = self.action[i]
+                    # 动作在训练约定，映射回固件约定；逐关节 action scale
                     tgt = (DEFAULT_POS[i]
-                           + JOINT_SIGN[i] * self.last_action[i] * config.action_scale)
-                tgt = np.clip(tgt, JOINT_LOWER[i], JOINT_UPPER[i])
+                           + JOINT_SIGN[i] * self.last_action[i] * config.action_scale[i])
+                else:
+                    self.last_action[i] = 0.0
+                    tgt = DEFAULT_POS[i]
+                lower = JOINT_LOWER[i]
+                upper = JOINT_UPPER[i]
+                if (self.runtime_state == RuntimeState.ActiveRL
+                        and config.rl_joint_limit_margin > 0.0):
+                    margin = min(
+                        config.rl_joint_limit_margin, 0.5 * (upper - lower))
+                    lower += margin
+                    upper -= margin
+                tgt = np.clip(tgt, lower, upper)
                 self.logical_target[i] = tgt
                 if handover:
                     blended = DEFAULT_POS[i] + alpha * (tgt - DEFAULT_POS[i])
@@ -1400,6 +1663,7 @@ class DeployController:
             f"rl_infer={1 if cmd.rl_inference else 0} "
             f"ramp_pct={ramp_pct:>3} "
             f"rl_fb={1 if self.rl_fallback_active else 0} "
+            f"phase={self.phase:.2f} hist={1 if self.history_ready else 0} "
             f"z={z:.4f} "
             f"q0={q[0]:+.3f} q1={q[1]:+.3f} q2={q[2]:+.3f}"
         )
@@ -1412,8 +1676,35 @@ class DeployController:
 # 主函数
 # ══════════════════════════════════════════════════════════════════════
 
+def find_training_root(explicit: str = "") -> str:
+    """Locate the OpenDoge_train checkout that owns the training XML/STLs."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = [
+        explicit,
+        os.path.join(repo_root, "..", "OpenDoge_train"),
+        os.path.join(repo_root, "..", "..", "OpenDoge_train"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate = os.path.abspath(candidate)
+        xml = os.path.join(
+            candidate, "src", "assets", "robots", "opendoge", "xmls", "opendoge.xml"
+        )
+        if os.path.isfile(xml):
+            return candidate
+    return ""
+
+
+def training_scene_path(training_root: str) -> str:
+    return os.path.join(
+        training_root, "src", "assets", "robots", "opendoge", "xmls",
+        "scene_opendoge.xml",
+    )
+
+
 def find_model_path() -> str:
-    """查找 MuJoCo XML 模型路径"""
+    """查找固件 MuJoCo XML 模型路径 (legacy/firmware convention)."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     candidates = [
         os.path.join(repo_root, "docs", "URDF", "xml", "scene.xml"),
@@ -1477,10 +1768,10 @@ def parse_args():
     p.add_argument("--joy-btn-b", type=int, default=1, help="B 键号 (默认 1)")
     p.add_argument("--joy-btn-x", type=int, default=3, help="X 键号 (默认 3)")
     p.add_argument("--joy-btn-y", type=int, default=4, help="Y 键号 (默认 4)")
-    p.add_argument("--joy-btn-back", type=int, default=7,
-                   help="BACK/low_gain 键号 (默认 7 = RB)")
-    p.add_argument("--joy-btn-start", type=int, default=6,
-                   help="START/使能 键号 (默认 6 = LB；Home=12，长按会关机)")
+    p.add_argument("--joy-btn-back", type=int, default=None,
+                   help="BACK/low_gain 键号 (BEITONG 可选 M6=13；默认不指定)")
+    p.add_argument("--joy-btn-start", type=int, default=None,
+                   help="START/使能 键号 (BEITONG 可选 M5=14；默认不指定)")
     p.add_argument("--joy-debug", action="store_true",
                    help="打印原始手柄事件 (确认轴/按键编号时使用)")
     p.add_argument(
@@ -1528,19 +1819,38 @@ def parse_args():
         help="日志输出目录 (默认 logs/)"
     )
     p.add_argument(
-        "--lin-vel-mode", choices=["true", "zero", "command", "noisy"],
-        default="true",
-        help="观测中 base_lin_vel 的来源: true=仿真真值, zero=置零, "
-             "command=速度指令近似, noisy=真值+U(-0.5,0.5)"
+        "--training-root", type=str, default="",
+        help="OpenDoge_train 仓库路径 (默认自动查找同级 ../OpenDoge_train)"
+    )
+    p.add_argument(
+        "--terrain", choices=["flat", "rough", "stairs", "boxes", "slope"],
+        default="flat",
+        help="仿真地形 (flat/rough/stairs/boxes/slope)"
+    )
+    p.add_argument(
+        "--terrain-level", type=int, default=1,
+        help="地形难度 0-3 (rough/stairs/boxes)"
+    )
+    p.add_argument(
+        "--terrain-seed", type=int, default=0,
+        help="地形随机种子"
+    )
+    p.add_argument(
+        "--fall-angle-deg", type=float, default=70.0,
+        help="摔倒判定角 (度, 从竖直方向)"
+    )
+    p.add_argument(
+        "--auto-reset", action="store_true",
+        help="摔倒后自动重置到默认姿态并继续 (地形批量测试用)"
     )
     p.add_argument(
         "--joint-convention", choices=["firmware", "training"],
-        default="firmware",
-        help="模型关节符号约定: firmware=docs/URDF/xml, training=LainLab mjlab XML"
+        default="training",
+        help="模型关节符号约定: training=OpenDoge_train mjlab XML (默认), firmware=docs/URDF/xml"
     )
     p.add_argument(
         "--start-pose", choices=["rest", "default"], default="rest",
-        help="初始姿态: rest=趴伏 (Ready), default=站立默认位 (消融实验)"
+        help="初始姿态: rest=趴伏 (Ready), default=站立默认位 (RL/地形测试)"
     )
     p.add_argument(
         "--base-height", type=float, default=0.158,
@@ -1548,7 +1858,7 @@ def parse_args():
     )
     p.add_argument(
         "--seed", type=int, default=0,
-        help="--lin-vel-mode noisy 的噪声随机种子"
+        help="随机种子"
     )
     return p.parse_args()
 
@@ -1568,7 +1878,26 @@ def main():
         print("错误: MuJoCo 未安装。运行: pip install mujoco", file=sys.stderr)
         sys.exit(1)
 
-    model_path = args.model if args.model else find_model_path()
+    training_root = find_training_root(args.training_root)
+    if args.model:
+        model_path = args.model
+    elif training_root:
+        model_path = training_scene_path(training_root)
+    else:
+        model_path = find_model_path()
+    if args.terrain != "flat":
+        if not training_root:
+            print(
+                "错误: --terrain 需要 OpenDoge_train 训练资产 "
+                "(--training-root 或同级 ../OpenDoge_train)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        from terrain import build_scene
+        model_path = build_scene(
+            training_root, args.terrain, args.terrain_level, args.terrain_seed
+        )
+    print(f"训练仓库: {training_root or '(未找到, 使用固件模型)'}")
     print(f"模型: {model_path}")
 
     if args.joint_convention == "training":
@@ -1578,7 +1907,6 @@ def main():
     config = DeployConfig(
         pc_startup_ramp_s=args.ramp,
         pc_startup_max_deviation=args.max_deviation,
-        lin_vel_mode=args.lin_vel_mode,
         imu_delay_ms=args.imu_delay_ms,
         joint_delay_ms=args.joint_delay_ms,
         packet_loss=args.packet_loss,
@@ -1643,7 +1971,7 @@ def main():
     print()
     print(
         f"配置: kp={config.kp}, kd={config.kd}, safe_kd={config.safe_kd}, "
-        f"action_scale={config.action_scale}"
+        f"action_scale={config.action_scale.tolist()}"
     )
     print(f"斜坡: {config.pc_startup_ramp_s}s, 最大偏差: {config.pc_startup_max_deviation}rad")
     print(f"初始模式: {args.mode}")
@@ -1692,13 +2020,14 @@ def main():
         mock_policy=mock_policy,
         static_vx=args.cmd[0], static_vy=args.cmd[1], static_yaw=args.cmd[2],
         logger=logger,
-        lin_vel_mode=args.lin_vel_mode,
         seed=args.seed,
     )
 
     start_time = time.time()
     last_status_time = start_time
     step_count = 0
+    fall_count = 0
+    fall_latched = False
     paused = False
 
     try:
@@ -1721,6 +2050,22 @@ def main():
                 if not controller.step():
                     break
                 step_count += 1
+                if controller.runtime_state == RuntimeState.ActiveRL:
+                    gz = sim.get_imu().projected_gravity[2]
+                    fallen = gz > -math.cos(math.radians(args.fall_angle_deg))
+                    if fallen and not fall_latched:
+                        fall_count += 1
+                        fall_latched = True
+                        print(
+                            f"\n[{sim.data.time:.3f}s] FALL detected "
+                            f"(gravity.z={gz:.3f}, angle>{args.fall_angle_deg:.0f} deg)"
+                        )
+                        if args.auto_reset:
+                            controller.reset_after_fall(sim.data.time)
+                            fall_latched = False
+                            print(f"[{sim.data.time:.3f}s] auto-reset -> ActiveRL")
+                    elif not fallen:
+                        fall_latched = False
             else:
                 # 暂停时仍推进渲染
                 sim.step_count += 1
@@ -1750,6 +2095,7 @@ def main():
             f"\n仿真结束。运行 {elapsed:.1f}s, "
             f"物理时间 {sim_time:.2f}s, "
             f"{step_count} 步, "
+            f"fall={fall_count}, "
             f"平均 {step_count / max(elapsed, 0.001):.0f} Hz",
             flush=True,
         )

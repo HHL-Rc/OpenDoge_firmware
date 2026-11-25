@@ -79,16 +79,6 @@ int main(int argc, char ** argv)
     std::cerr << "Config load failed: " << error << "\n";
     return 1;
   }
-  if (!opt.lin_vel_source.empty()) {
-    config.lin_vel_source = opt.lin_vel_source;
-  }
-  if (config.lin_vel_source != "zero" && config.lin_vel_source != "command" &&
-      config.lin_vel_source != "imu")
-  {
-    std::cerr << "Invalid lin_vel_source: " << config.lin_vel_source
-              << " (expected zero|command|imu)\n";
-    return 1;
-  }
   if (opt.kp_override >= 0.0) {
     config.kp = opt.kp_override;
   }
@@ -130,7 +120,10 @@ int main(int argc, char ** argv)
   std::array<opendoge::MotorCommand, opendoge::kNumJoints> commands{};
   std::array<double, opendoge::kNumJoints> action{};
   std::array<double, opendoge::kNumJoints> last_action{};
-  std::array<double, opendoge::kObsDim> obs{};
+  opendoge::HistoryBuffer obs_history;
+  opendoge::ObsHistory history{};
+  bool history_ready{false};
+  double rl_start_s{-1.0};
   std::array<double, opendoge::kNumJoints> logical_target = default_pos;
   std::array<double, opendoge::kNumJoints> limited_target = default_pos;
 
@@ -147,6 +140,75 @@ int main(int argc, char ** argv)
   if (!policy->load(opt.policy_path, error)) {
     std::cerr << "Policy load failed: " << error << "\n";
     return 1;
+  }
+
+  // Validate the policy contract against this deploy build and the config.
+  // A model trained for a different observation/action layout must never run.
+  const auto & info = policy->info();
+  if (!info.valid) {
+    std::cerr << "Policy contract is missing; refusing to run.\n";
+    return 1;
+  }
+  {
+    std::string contract_error;
+    if (info.observation_dim != opendoge::kObsDim) {
+      contract_error = "observation_dim != 47";
+    } else if (info.history_length != opendoge::kObsHistoryLength) {
+      contract_error = "history_length != 5";
+    } else if (info.action_dim != opendoge::kNumJoints) {
+      contract_error = "action_dim != 12";
+    } else if (std::abs(info.control_dt_s - opendoge::kPolicyDt) > 1.0e-6) {
+      contract_error = "control_dt_seconds != 0.02";
+    } else {
+      for (std::size_t i = 0; i < opendoge::kNumJoints; ++i) {
+        if (std::abs(info.action_scale[i] - config.action_scale[i]) > 1.0e-9) {
+          contract_error = "action_scale mismatch at joint " + joints[i].name;
+          break;
+        }
+        const double expected_default =
+          opendoge::kJointSign[i] * default_pos[i];
+        if (std::abs(info.default_joint_positions[i] - expected_default) > 1.0e-6) {
+          contract_error = "default_joint_positions mismatch at joint " + joints[i].name;
+          break;
+        }
+        if (info.joint_names[i] != joints[i].name) {
+          contract_error = "joint_names mismatch at index " + std::to_string(i);
+          break;
+        }
+      }
+    }
+    if (!contract_error.empty()) {
+      std::cerr << "Policy contract rejected: " << contract_error << "\n";
+      return 1;
+    }
+  }
+  std::cout << "Policy contract: obs=" << info.observation_dim
+            << " history=" << info.history_length
+            << " dt=" << info.control_dt_s
+            << " action_dim=" << info.action_dim << "\n";
+
+  if (opt.verify_policy) {
+    // Deterministic standing frame: zero ang_vel, gravity [0,0,-1], zero
+    // joints/actions/command/phase, repeated across the five-frame history.
+    opendoge::ObsFrame frame{};
+    frame[3] = 0.0;
+    frame[4] = 0.0;
+    frame[5] = -1.0;
+    opendoge::HistoryBuffer probe;
+    probe.reset(frame);
+    const auto probe_history = probe.flatten();
+    std::array<double, opendoge::kNumJoints> probe_action{};
+    std::string verify_error;
+    if (!policy->infer(probe_history, probe_action, verify_error)) {
+      std::cerr << "verify-policy inference failed: " << verify_error << "\n";
+      return 1;
+    }
+    std::cout << "verify-policy action:";
+    for (double value : probe_action) {
+      std::cout << " " << value;
+    }
+    std::cout << "\n";
+    return 0;
   }
 
   opendoge::El05SocketCan can;
@@ -569,14 +631,6 @@ int main(int argc, char ** argv)
         fault_reason = error;
         runtime_state = opendoge::RuntimeState::DampingFault;
       }
-      // base_lin_vel is not measured by the stock IMU bridge. Resolve the
-      // configured source: zero (worst case), command approximation, or the
-      // optional vx/vy/vz fields from the IMU state file.
-      if (config.lin_vel_source == "zero") {
-        imu.linear_velocity = {0.0, 0.0, 0.0};
-      } else if (config.lin_vel_source == "command") {
-        imu.linear_velocity = {command.vx, command.vy, 0.0};
-      }
       if (!opt.allow_missing_imu && !imu.valid) {
         ++imu_invalid_count;
       } else {
@@ -689,6 +743,40 @@ int main(int argc, char ** argv)
       standup_handover_start_s = t;
     }
 
+    // ── ActiveRL episode boundary ──
+    // The SuperMimic policy consumes a five-frame history and a gait clock that
+    // both reset at the training episode boundary. Entering ActiveRL is the
+    // deployment equivalent: repeat the current frame five times, zero the
+    // previous action, and start the phase clock at zero.
+    const bool entered_rl =
+      prev_runtime_state != opendoge::RuntimeState::ActiveRL &&
+      runtime_state == opendoge::RuntimeState::ActiveRL;
+    if (entered_rl) {
+      rl_start_s = t;
+      standup_handover_start_s = t;
+      action.fill(0.0);
+      last_action.fill(0.0);
+      const std::array<double, 2> phase0{0.0, 0.0};
+      const auto frame0 = opendoge::buildObservationFrame(
+        states, config.joints, default_pos, last_action, command, imu, phase0);
+      obs_history.reset(frame0);
+      history_ready = true;
+    }
+    const bool left_rl =
+      prev_runtime_state == opendoge::RuntimeState::ActiveRL &&
+      runtime_state != opendoge::RuntimeState::ActiveRL;
+    if (left_rl) {
+      rl_start_s = -1.0;
+      history_ready = false;
+      obs_history.clear();
+      action.fill(0.0);
+      last_action.fill(0.0);
+      standup_handover_start_s = -1.0;
+      loop_stats.history_ready = false;
+      loop_stats.rl_episode_active = false;
+      loop_stats.last_phase = 0.0;
+    }
+
     // Observation-side feedback staleness: a type-2 status path can die while
     // a type-17 retry keeps q/dq fresh. Default hold keeps the old behaviour;
     // freeze skips inference; fault enters DampingFault.
@@ -715,20 +803,26 @@ int main(int argc, char ** argv)
       }
     }
 
-    // ── Inference block (100 Hz) ──
+    // ── Inference block (50 Hz, ActiveRL only) ──
     if (t >= next_infer_s) {
       ++loop_stats.inference_ticks;
-      if ((runtime_state == opendoge::RuntimeState::ActiveRL || runtime_state == opendoge::RuntimeState::EnteringPosition
-           || runtime_state == opendoge::RuntimeState::ActivePC) && command.active &&
-          !(feedback_stale && config.stale_action == "freeze")) {
+      const bool freeze = feedback_stale && config.stale_action == "freeze";
+      if (freeze && runtime_state == opendoge::RuntimeState::ActiveRL) {
+        // The history is a time-regular 5-frame window. A skipped inference
+        // makes it non-regular, so invalidate it and rebuild from the current
+        // frame after the feedback path recovers.
+        history_ready = false;
+        obs_history.clear();
+      }
+      if (runtime_state == opendoge::RuntimeState::ActiveRL && command.active &&
+          history_ready && !freeze) {
         // Refresh observation inputs at the inference tick. The 200 Hz
         // safety/command poll above is intentionally kept (it bounds file I/O
         // and preserves the command EMA / IMU debounce rates), but it adds up
         // to one poll period to the policy observation. Draining CAN and
         // re-reading the bridge file here removes that phase: the bridge now
         // writes on new gyro/quat frames instead of every 5 ms, so this sees
-        // the freshest sample. No observation dimension, action_scale,
-        // default pose or control-law change.
+        // the freshest sample.
         if (!opt.dry_run) {
           can.drain(states, t);
         }
@@ -737,11 +831,6 @@ int main(int argc, char ** argv)
           std::string imu_refresh_error;
           if (opendoge::readImuFile(opt.imu_file, fresh_imu, t, imu_refresh_error) &&
               fresh_imu.valid) {
-            if (config.lin_vel_source == "zero") {
-              fresh_imu.linear_velocity = {0.0, 0.0, 0.0};
-            } else if (config.lin_vel_source == "command") {
-              fresh_imu.linear_velocity = {command.vx, command.vy, 0.0};
-            }
             imu = fresh_imu;
           }
         }
@@ -756,19 +845,45 @@ int main(int argc, char ** argv)
           (imu.valid && imu.source_stamp_s > 0.0)
             ? std::max(0.0, t - imu.source_stamp_s) : -1.0;
         loop_stats.last_obs_joint_age_s = obs_joint_age_s;
-        obs = opendoge::buildObservation(states, config.joints, default_pos, last_action, command, imu);
-        if (!policy->infer(obs, action, error)) {
-          if (runtime_state == opendoge::RuntimeState::ActiveRL) {
-            runtime_state = opendoge::RuntimeState::ActivePC;
-            rl_fallback_active = true;
-            action.fill(0.0);
-          } else {
-            fault_reason = "policy infer failed: " + error;
-            runtime_state = opendoge::RuntimeState::DampingFault;
-          }
+
+        const double elapsed = std::max(0.0, t - rl_start_s);
+        const long phase_steps = std::lround(elapsed / (1.0 / config.inference_hz));
+        const long period_steps = std::max(
+          1L, std::lround(config.gait_period_s * config.inference_hz));
+        loop_stats.last_phase =
+          static_cast<double>(phase_steps % period_steps) /
+          static_cast<double>(period_steps);
+        loop_stats.history_ready = history_ready;
+        loop_stats.rl_episode_active = true;
+        const auto phase = opendoge::gaitPhaseFeatures(
+          elapsed, 1.0 / config.inference_hz, config.gait_period_s,
+          config.gait_command_threshold, command);
+        const auto frame = opendoge::buildObservationFrame(
+          states, config.joints, default_pos, last_action, command, imu, phase);
+        obs_history.append(frame);
+        history = obs_history.flatten();
+        if (!policy->infer(history, action, error)) {
+          std::cerr << "Warning: policy inference failed, falling back to "
+                       "ActivePC: " << error << "\n";
+          runtime_state = opendoge::RuntimeState::ActivePC;
+          rl_fallback_active = true;
+          history_ready = false;
+          obs_history.clear();
+          action.fill(0.0);
+          last_action.fill(0.0);
         }
       } else {
         action.fill(0.0);
+        // Rebuild the history with the current frame after a skipped tick.
+        if (runtime_state == opendoge::RuntimeState::ActiveRL && command.active &&
+            !freeze && !history_ready) {
+          const std::array<double, 2> phase0{0.0, 0.0};
+          const auto frame0 = opendoge::buildObservationFrame(
+            states, config.joints, default_pos, last_action, command, imu, phase0);
+          obs_history.reset(frame0);
+          history_ready = true;
+          rl_start_s = t;
+        }
       }
       next_infer_s = t + 1.0 / config.inference_hz;
     }

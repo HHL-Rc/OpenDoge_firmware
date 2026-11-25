@@ -265,13 +265,12 @@ void updateTargets(
   double t,
   double standup_handover_start_s)
 {
-  // One-shot blend after a supervised stand-up. The first policy action can
-  // be large; without this the ActiveRL branch jumps the target instantly and
-  // the calf can snap (large gz spike that trips the fall check). The blend
-  // starts at the default pose and ramps to the full policy target.
+  // One-shot blend after entering ActiveRL. The first policy action can be
+  // large; without this the ActiveRL branch jumps the target instantly and the
+  // calf can snap (large gz spike that trips the fall check). The blend starts
+  // at the default pose and ramps to the full policy target.
   const bool handover =
-    (runtime_state == RuntimeState::ActiveRL ||
-     runtime_state == RuntimeState::ActivePC) &&
+    runtime_state == RuntimeState::ActiveRL &&
     standup_handover_start_s >= 0.0 &&
     t - standup_handover_start_s < config.standup_handover_s;
   const double handover_alpha = handover
@@ -282,19 +281,32 @@ void updateTargets(
 
   for (std::size_t i = 0; i < kNumJoints; ++i) {
     const auto & joint_cfg = calib[i];
-    // LainLab / mjlab JointPositionAction: processed = raw * scale + default,
+    // OpenDoge_train JointPositionAction: processed = raw * scale + default,
     // with no clipping. The raw policy output is also what the actor observes
-    // as `last_action`, so store it unmodified.
-    last_action[i] = action[i];
-    if (runtime_state == RuntimeState::LowGainTest ||
-        runtime_state == RuntimeState::StandingUp) {
-      logical_target[i] = default_pos[i];
-    } else {
+    // as `last_action`, so store it unmodified. Only ActiveRL consumes policy
+    // actions; ActivePC/EnteringPosition hold the default standing pose.
+    if (runtime_state == RuntimeState::ActiveRL) {
+      last_action[i] = action[i];
       // action is in training convention; map it back to firmware convention.
       logical_target[i] =
-        default_pos[i] + kJointSign[i] * last_action[i] * config.action_scale;
+        default_pos[i] + kJointSign[i] * last_action[i] * config.action_scale[i];
+    } else {
+      last_action[i] = 0.0;
+      logical_target[i] = default_pos[i];
     }
-    logical_target[i] = std::clamp(logical_target[i], joint_cfg.lower, joint_cfg.upper);
+    // Keep a small margin inside the configured joint range in ActiveRL so an
+    // impact/overshoot does not immediately hit the mechanical hard stop. The
+    // training target is still default + sign * action * scale; only the final
+    // safety clamp is tightened by rl_joint_limit_margin.
+    double lower = joint_cfg.lower;
+    double upper = joint_cfg.upper;
+    if (runtime_state == RuntimeState::ActiveRL && config.rl_joint_limit_margin > 0.0) {
+      const double margin = std::min(
+        config.rl_joint_limit_margin, 0.5 * (upper - lower));
+      lower += margin;
+      upper -= margin;
+    }
+    logical_target[i] = std::clamp(logical_target[i], lower, upper);
     if (handover) {
       // Blend from the settled default pose to the policy target and keep the
       // rate limiter active even in ActiveRL for this one-shot window.
@@ -305,8 +317,9 @@ void updateTargets(
       // RL mode: skip rate_limit (policy trained with instantaneous target changes)
       limited_target[i] = logical_target[i];
     } else {
-      // LowGainTest uses a slower slew so the stand-up from the measured pose
-      // is a ramp, not a step. main.cpp snapshots limited_target on entry.
+      // PC / LowGain / StandingUp use a slew-limited target. LowGainTest and
+      // StandingUp start from the measured pose (main.cpp snapshots it on
+      // entry), so this is a ramp, not a step.
       double max_step = joint_cfg.max_position_step;
       if (runtime_state == RuntimeState::LowGainTest) {
         max_step = std::min(max_step, std::max(config.low_gain_max_position_step, 0.0));

@@ -750,3 +750,55 @@ rate limit 瞬时目标运行。实机重点验证：交接瞬间 `target` 是�
 - 验证：`--mode idle`、`--mode rl --max-deviation 0.25 --imu-delay-ms 10
   --joint-delay-ms 5`、`--packet-loss 0.05 --loss-burst-ms 20 --cmd-loss 0.02`
   均可起身到 ActiveRL，无崩溃。
+
+---
+
+## Round 8: OpenDoge_train SuperMimic 47×5 迁移 (2026-11-17)
+
+Round 1-7 针对旧 48/49 维速度跟踪策略。本轮切换到 OpenDoge_train 的
+SuperMimic 策略（20,000 轮，Rough），契约与执行器完全不同。
+
+### 新契约
+
+| 项目 | 值 |
+|------|-----|
+| ONNX 输入 | `obs_history [batch,235]` |
+| 单帧观测 | 47 维：ang_vel(3)+gravity(3)+q(12)+dq(12)+last_action(12)+cmd(3)+phase(2) |
+| 历史 | 5 帧，旧→新，重置重复首帧 |
+| 控制 | 50 Hz 策略 / 200 Hz PD |
+| 动作缩放 | hip 0.25 / thigh 0.4 / calf 0.4 |
+| base_lin_vel | **无**（盲策略，内部 MoE 历史编码） |
+| 相位 | 0.5 s / 25 步 / `hypot(vx,vy)+abs(yaw)>0.1` 门控 |
+
+### 关键改动
+
+- `deploy_mujoco.py`：`build_observation_frame`、`gait_phase_features`、
+  `HistoryBuffer`、`OnnxPolicy` 动态输入名/metadata 校验、仅 ActiveRL 推理、
+  RL 入口重置历史/相位/动作、逐关节 action scale。
+- 训练物理对齐：`timestep=0.005`、`iterations=10`、`ls_iterations=20`、
+  `armature=0.005`、足端 `condim=3` / `friction=[1.0,0.005,0.0005]` /
+  `solref=[0.01,1.0]`、力矩 clamp 6/6/9。
+- 训练资产不复制到 `sim2sim/`：`--training-root` 直接引用 OpenDoge_train；
+  `terrain.py` 在临时目录复制 `opendoge.xml`、为训练 STL 建软链接、写地形 XML。
+- 新增 `--terrain flat|rough|stairs|boxes|slope`、`--terrain-level`、
+  `--terrain-seed`、`--fall-angle-deg`、`--auto-reset`；摔倒按
+  `projected_gravity` 超过阈值判定，auto-reset 会重置到默认姿态并重开
+  ActiveRL 回合。
+- 删除 `--lin-vel-mode`；`--joint-convention` 默认 `training`。
+
+### 训练资产 vs 固件资产
+
+实测两套资产不是同一模型：总质量 4.591 vs 4.796 kg；FL_hip 位置
+`[0.095,0.04,0.002]` vs `[0.1425,0.03999,0]`；STL 网格原点不同。
+因此 sim2sim 必须使用 OpenDoge_train 的训练 XML/STL，不能复用
+`docs/URDF/meshes`。详见 `docs/opendoge_supermimic_migration.md`。
+
+### 验证
+
+- `test/policy_contract_test.py`：21 passed。
+- `test/deploy_gap_regression.py`：49 passed。
+- C++ `--verify-policy` 与 Python golden 一致。
+- sim flat 10 s @ vx=0.4：平均 0.337 m/s、3.37 m、无 fault。
+- rough 10 s：平均 0.333 m/s、末态 z 0.184 m、无 fault。
+- stairs 8 s：末态 z 0.369 m、x 2.41 m、无 fault。
+- boxes 8 s：末态 z 0.172 m、x 2.55 m、无 fault。

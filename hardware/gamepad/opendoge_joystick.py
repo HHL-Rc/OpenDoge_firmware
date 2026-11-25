@@ -138,7 +138,10 @@ class RobotCommand:
 class XboxCommandMapper:
     """Maps common Xbox joystick axes/buttons to OpenDoge command fields."""
 
-    # Standard Xbox 360 joystick button numbering
+    # Standard Xbox 360 joystick button numbering.
+    # Per-controller profiles (Zikway / BEITONG) override these in
+    # xbox_command_bridge.apply_button_profile(); keep the Xbox defaults here
+    # so old 413d:2104 / xboxdrv controllers are unchanged.
     BUTTON_A = 0     # A (south)
     BUTTON_B = 1     # B (east)
     BUTTON_X = 2     # X (west)
@@ -270,9 +273,14 @@ class XboxCommandMapper:
             self.low_gain_mode = False
         # X: Toggle RL inference (only available in position control mode)
         elif button == self.btn_x:
-            if self.position_control and self.active_requested and not self.estop:
+            if not self.estop:
+                # X directly requests RL. This works even if the operator did
+                # not press A first; the deploy will enter StandingUp/ActiveRL
+                # as needed. A is still required to clear a latched fault.
+                self.active_requested = True
                 self.rl_inference = True
                 self.position_control = False
+                self.low_gain_mode = False
         # Y: Exit RL inference back to position control mode
         elif button == self.btn_y:
             if self.rl_inference and self.active_requested and not self.estop:

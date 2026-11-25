@@ -8,7 +8,7 @@
 hardware/imu/dm_imu_bridge.py             → /tmp/opendoge_imu.state      → opendoge_deploy 文件轮询
 hardware/gamepad/xbox_command_bridge.py  → /tmp/opendoge_command.state  → opendoge_deploy 文件轮询
 opendoge_deploy (C++, SCHED_FIFO)
-  → ONNX policy 推理 @ 100 Hz (CPU)；推理前重新 drain CAN + 重读 IMU 文件
+  → ONNX policy 推理 @ 50 Hz (CPU)；推理前重新 drain CAN + 重读 IMU 文件
   → 目标位置计算 @ 200 Hz (PD + rate limit)
   → EL05 运控帧发送 @ control_hz (q/dq/tau/kp/kd)
   → SocketCAN can0/can1/can2/can3
@@ -33,9 +33,9 @@ opendoge_deploy (C++, SCHED_FIFO)
 `main.cpp` 包含以下应独立模块化的逻辑：
 
 1. **状态机** (L45-75 枚举定义, L766-842 转换逻辑) → 应拆为 `controller.cpp`
-2. **观测构建** (L274-332, `buildObservation()`) → 应拆为 `observer.cpp`
+2. **观测构建** (L274-332, `buildObservationFrame()`) → 应拆为 `observer.cpp`
 3. **安全监控** (L350-465, `safetyFault()` + `JointSafetyState`) → 应拆为 `safety.cpp`
-4. **步态相位** (L261-269, `advancePhase()`) → 应拆为 `gait.cpp`
+4. **步态相位** (L261-269, `gaitPhaseFeatures()`) → 应拆为 `gait.cpp`
 5. **CLI 解析** (L96-177, `parseArgs()`) → 应拆为 `cli.cpp`
 6. **JSON 状态输出** (L970-1028) → 应拆为 `status.cpp`
 7. **PD 控制逻辑** (L887-943) → 应拆为 `controller.cpp`
@@ -44,8 +44,8 @@ opendoge_deploy (C++, SCHED_FIFO)
 
 `sim2sim/deploy_mujoco.py` 中的 `DeployController` 类完整复现了 `main.cpp` 的控制回路：
 - 状态机转换逻辑 — 两份实现
-- 观测构建 (`buildObservation` vs `build_observation`) — 两份实现
-- 步态相位 (`advancePhase` vs `advance_phase`) — 两份实现
+- 观测构建 (`buildObservationFrame` vs `build_observation_frame`) — 两份实现
+- 步态相位 (`gaitPhaseFeatures` vs `gait_phase_features`) — 两份实现
 - rate limiter — 两份实现
 
 任何对控制逻辑的修改必须同步两份代码。当前通过 `sim2sim/CLAUDE.md` 记录 Gap 来手动追踪一致性。
@@ -89,7 +89,8 @@ wz=0.0
 gx=0.0
 gy=0.0
 gz=-1.0
-# 可选: 机体线速度 (m/s)。缺省时按 lin_vel_source 处理
+# 可选: 机体线速度 (m/s)。当前 47x5 SuperMimic 策略不使用该字段；
+# 保留是为了兼容旧 bridge / 未来状态估计器。
 vx=0.0
 vy=0.0
 vz=0.0
@@ -102,23 +103,21 @@ vz=0.0
 
 ```
 # 控制频率
-inference_hz=100
+inference_hz=50
 target_hz=200
 control_hz=200   # 当前 CHIWU 原生 CAN；旧 USB-CAN bridge 时代是 100
 # 修改 64：观测在推理 tick 前刷新，不再等待 200 Hz 输入轮询相位；
 # 实际观测年龄看 status 的 obs_imu_age_ms / obs_joint_age_ms。
 
-# PD 增益 (LainLab BuiltinPositionActuatorCfg: stiffness=12.0, damping=0.5)
+# PD 增益 (OpenDoge_train BuiltinPositionActuatorCfg: stiffness=12.0, damping=0.5)
 kp=12.0
-kd=0.65          # 2026-11-07 现场调参；训练值 0.5（修改 64 前记录 kd=0.8 的效果）
+kd=0.5           # 训练值；实机如振荡再用 --kd 或配置微调到 0.65/0.8
 safe_kd=2.0
-action_scale=0.25
-
-# 48 维观测中 base_lin_vel 的来源:
-#   zero    — 恒为 0 (最保守)
-#   command — 用速度指令近似 (默认)
-#   imu     — 读取 imu.state 的可选 vx/vy/vz
-lin_vel_source=command
+action_scale_hip=0.25
+action_scale_thigh=0.4
+action_scale_calf=0.4
+gait_period_s=0.5
+gait_command_threshold=0.1
 
 # EL05 电机侧失联保护 (0x7028 canTimeout, RAM-only)
 # 0=关闭；非 0 时电机在这么久收不到 CAN 指令会自动 reset/释放。
@@ -126,7 +125,7 @@ lin_vel_source=command
 can_timeout_s=1.0
 
 # 安全阈值
-state_timeout_s=0.1   # 当前 live config；旧文档的 0.02 是更早的保守值
+state_timeout_s=0.15  # highrate 曾见 122-131 ms 全局反馈间隙；0.15 吸收 burst
 # 新增可观测/策略（默认 warn/hold/warn，不改变控制行为）
 imu_timeout_s=0.25
 imu_stale_action=warn       # warn|fault
@@ -139,6 +138,11 @@ torque_threshold=3.0
 torque_timeout_s=0.5
 tracking_error_threshold=0.5
 tracking_error_timeout_s=0.3
+# 台阶/接触丰富 ActiveRL 的放宽阈值（平地可改回 0.5/0.3）
+rl_tracking_error_threshold=0.65
+rl_tracking_error_timeout_s=0.5
+# ActiveRL 目标保留在关节限位内的余量 (rad)
+rl_joint_limit_margin=0.03
 command_timeout_s=0.5
 fall_gravity_z_threshold=0.3
 fall_timeout_s=0.3
@@ -182,18 +186,23 @@ joint.FL_hip_joint.max_position_step=0.015
 - 默认 `imu_stale_action=warn`、`stale_action=hold`、`can_error_action=warn`；
   需要更激进的行为时显式改成 `fault`/`freeze`。
 
-### Observation 格式 (48 维, LainLab mjlab actor obs)
+### Observation 格式 (47 维 × 5 帧, OpenDoge_train SuperMimic)
 
 ```
-base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3)
-+ joint_pos_rel(12) + joint_vel_rel(12) + last_action(12) + command(3)
+base_ang_vel(3) + projected_gravity(3)
++ joint_pos_rel(12) + joint_vel_rel(12) + last_action(12)
++ command(3) + gait_phase_sin_cos(2) = 47
 ```
 
-- 关节位置/速度需经 `kJointSign` 从固件 URDF 约定映射到训练约定
-- `last_action` 为原始策略输出，**不裁剪、不翻转符号**
-- 无步态相位 (新策略端到端生成步态)
-- `base_lin_vel` 由 `lin_vel_source` 配置 (真机 IMU 无此测量)
-- 旧 49 维布局保留在 `buildLegacyObservation()`，仅供调试
+- 策略是盲本体策略：**没有 `base_lin_vel`**；机身速度由 ONNX 内部 MoE 历史编码器估计。
+- ONNX 输入是 5 帧历史扁平化后的 **235 维**（旧→新），重置时重复首帧。
+- 关节位置/速度需经 `kJointSign` 从固件 URDF 约定映射到训练约定。
+- `last_action` 为原始策略输出，**不裁剪、不翻转符号**。
+- 动作缩放逐关节：hip 0.25 / thigh 0.4 / calf 0.4。
+- 步态相位：`steps=round(elapsed/0.02)`、`p=(steps%25)/25`、
+  `hypot(vx,vy)+abs(yaw)>0.1` 时输出 `[sin(2πp),cos(2πp)]`，否则 0。
+- 仅 `ActiveRL` 运行策略；`ActivePC`/`EnteringPosition` 保持默认站姿。
+- 旧 49/48 维布局已删除，不再保留 `buildLegacyObservation()`。
 
 ## 与外部的关系
 
@@ -202,24 +211,28 @@ base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3)
 `sim2sim/deploy_mujoco.py` 是 `main.cpp` 控制回路的 Python 级验证仿真器。修改 `main.cpp` 的控制逻辑后，必须同步更新 `deploy_mujoco.py`，反之亦然。关键同步点：
 
 - 状态机转换规则
-- `buildObservation()` / `build_observation()` 观测维度、顺序、归一化
-- `advancePhase()` / `advance_phase()` 步态公式
+- `buildObservationFrame()` / `build_observation_frame()` — 47 维单帧、5 帧历史
+- `HistoryBuffer` — 旧→新、重置重复首帧、ActiveRL 入口重置
+- `gaitPhaseFeatures()` / `gait_phase_features()` — 0.5 s / 25 步 / 移动门控
 - `rateLimit()` / `rate_limit()` 限速语义
 - PD 增益逻辑 (阻尼/斜坡/Active/LowGain)
-- `last_action` 的 clamp 语义 (RL 模式不 clamp)
+- `last_action` 的原始值语义（不裁剪）
+- 仅 ActiveRL 推理；PC 保持默认站姿
 
-### 与 LainLab 训练侧的关系
+### 与 OpenDoge_train 训练侧的关系
 
 - `DeployConfig.kp/kd/action_scale` 必须匹配训练侧
   `BuiltinPositionActuatorCfg(stiffness=12.0, damping=0.5)` 与
-  `JointPositionActionCfg(scale=0.25)`
+  `JointPositionActionCfg(scale={hip:0.25, thigh:0.4, calf:0.4})`
 - `defaultJointPosition()` 必须匹配训练侧 `default_joint_pos`，当前每腿
   `(0, 0.8, -1.6)` (固件约定)
-- 观测结构必须与训练 actor 观测一致 (当前 **48 维**，含 `base_lin_vel`)
-- 关节符号必须经 `kJointSign` 映射，详见 `sim2sim/CLAUDE.md` Round 4
-- ONNX 模型中的 obs_normalizer 使用训练期 running mean/std
-- XML 物理参数 (joint damping/frictionloss/armature, foot friction/solimp/condim,
-  cone/impratio) 已对齐 → 见 `sim2sim/CLAUDE.md`
+- 观测结构必须与训练 actor 观测一致 (当前 **47 维 × 5 帧 = 235**，**无** `base_lin_vel`)
+- 控制频率必须匹配训练 `control_dt_seconds=0.02` (50 Hz)
+- 启动时通过 ONNX metadata 校验 input shape、history、dt、action scales、
+  default positions、joint names；不一致拒绝启动
+- 关节符号必须经 `kJointSign` 映射，详见 `sim2sim/CLAUDE.md` Round 8
+- 训练仿真必须使用 `OpenDoge_train` 的训练 XML/STL；固件 `docs/URDF/` 是实机模型，
+  两者质量/偏置/网格不同，不可混用 → 见 `docs/opendoge_supermimic_migration.md`
 
 ### 与 daemons / bringup 的关系
 
@@ -279,7 +292,7 @@ WaitFeedback → Ready ↔ EnteringPosition → ActivePC ↔ ActiveRL
 
 1. **新增配置参数**: 在 `DeployConfig` (`types.hpp`) 中加字段 → `runtime_io.cpp` 的 `loadDeployConfig()` 增加解析 → `main.cpp` 按需使用
 2. **新增状态**: 在 `RuntimeState` 枚举添加 → 所有 switch(state) 处增加处理
-3. **修改观测格式**: `buildObservation()` + `deploy_mujoco.py` 的 `build_observation()` 同步修改，确保维度为 `kObsDim`
+3. **修改观测格式**: `buildObservationFrame()` + `deploy_mujoco.py` 的 `build_observation_frame()` 同步修改，同时维护 `HistoryBuffer` 与 235 维输入
 4. **修改 CAN 协议**: `el05_socketcan.cpp` + `hardware/motor/el05_motor_menu.py` 同步修改
 5. **修改控制回路**: `main.cpp` 的控制块 (L887-943) + `deploy_mujoco.py` 的 `DeployController.step()` 同步修改
 6. **新增 policy backend**: 实现 `Policy` 接口 → 在 `makePolicy()` 注册

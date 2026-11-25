@@ -1,0 +1,442 @@
+{
+  "config": {
+    "algo": {
+      "action_noise": 0.3,
+      "actor_hidden": [
+        512,
+        256,
+        128
+      ],
+      "actor_lr_scale": 4.0,
+      "actor_optimizer": "muon_adam",
+      "actor_ramp_iterations": 1000,
+      "archive_keep_prob": 0.02,
+      "archive_size": 100000,
+      "collapse_falls": 3.0,
+      "collapse_interval": 50,
+      "collect_det_frac": 0.25,
+      "collect_steps": 2.5,
+      "compile_backend": "inductor",
+      "compile_imagination": true,
+      "critic_epochs": 5,
+      "critic_hidden": [
+        512,
+        256,
+        128
+      ],
+      "critic_minibatches": 4,
+      "critic_warmup_iterations": 500,
+      "driver_fade": [
+        1000000000,
+        1000000000
+      ],
+      "driver_frac": 0.25,
+      "expert_frac": 0.0,
+      "gamma": 0.99,
+      "grad_clip": 1.0,
+      "grad_clip_element": 0.1,
+      "horizon": 32,
+      "imag_batch": 2048,
+      "lam": 0.95,
+      "learning_rate": 0.0004,
+      "lr_decay_iterations": 30000,
+      "lr_final_frac": 0.03,
+      "moe_expert_num": 8,
+      "moe_hidden": [
+        512,
+        256,
+        128
+      ],
+      "moe_latent_dim": 32,
+      "muon_weight_decay": 0.1,
+      "replay_capacity": 1000,
+      "velocity_loss_coef": 1.0,
+      "warmup_iterations": 0,
+      "wm_archive_frac": 0.25,
+      "wm_batch": 2048,
+      "wm_hidden": [
+        1024,
+        1024,
+        1024
+      ],
+      "wm_optimizer": "muon_adam",
+      "wm_prioritized_frac": 0.25,
+      "wm_rewarmup_iterations": 1500,
+      "wm_updates": 5,
+      "wm_window": 8
+    },
+    "algorithm": "moe_history",
+    "asset": {
+      "base_body": "base_link",
+      "robot": "opendoge_reference"
+    },
+    "collision": {
+      "body_condim": 1,
+      "enable_self_collision": true,
+      "foot_condim": 3,
+      "foot_friction": [
+        1.0,
+        0.005,
+        0.0005
+      ],
+      "foot_priority": 1,
+      "solref": [
+        0.01,
+        1.0
+      ]
+    },
+    "commands": {
+      "heading_command": true,
+      "heading_control_stiffness": 0.5,
+      "heading_range": [
+        -3.14,
+        3.14
+      ],
+      "initial_ranges": [
+        [
+          -0.6,
+          0.6
+        ],
+        [
+          -0.5,
+          0.5
+        ],
+        [
+          -1.5,
+          1.5
+        ]
+      ],
+      "reference_steps_per_iteration": 1,
+      "rel_forward_envs": 0.05,
+      "rel_heading_envs": 1.0,
+      "rel_standing_envs": 0.1,
+      "resampling_time": [
+        4.0,
+        12.0
+      ],
+      "stages": [],
+      "zero_probability_end": 0.1,
+      "zero_probability_iterations": 1,
+      "zero_probability_start": 0.1
+    },
+    "control": {
+      "action_scales": {
+        "hip": 0.25,
+        "thigh": 0.4,
+        "calf": 0.4
+      },
+      "armature": {
+        "hip": 0.005,
+        "thigh": 0.005,
+        "calf": 0.005
+      },
+      "damping": {
+        "hip": 0.5,
+        "thigh": 0.5,
+        "calf": 0.5
+      },
+      "decimation": 4,
+      "delay_hold_prob": 0.5,
+      "delay_max_lag": 4,
+      "delay_min_lag": 0,
+      "delay_update_period": 10,
+      "effort_limit": {
+        "hip": 6.0,
+        "thigh": 6.0,
+        "calf": 9.0
+      },
+      "soft_joint_pos_limit_factor": 0.9,
+      "stiffness": {
+        "hip": 12.0,
+        "thigh": 12.0,
+        "calf": 12.0
+      },
+      "velocity_limit": {
+        "hip": 30.1,
+        "thigh": 30.1,
+        "calf": 20.07
+      }
+    },
+    "domain_randomization": {
+      "com_range": {
+        "x": [
+          -0.015,
+          0.015
+        ],
+        "y": [
+          -0.015,
+          0.015
+        ],
+        "z": [
+          -0.018,
+          0.018
+        ]
+      },
+      "enabled": true,
+      "encoder_bias_range": [
+        -0.015,
+        0.015
+      ],
+      "friction_range": [
+        0.3,
+        1.5
+      ],
+      "roll_friction_range": [
+        1e-05,
+        0.005
+      ],
+      "spin_friction_range": [
+        0.0001,
+        0.02
+      ]
+    },
+    "env": {
+      "episode_length_s": 20.0,
+      "history_size": 5,
+      "num_actions": 12,
+      "num_critic_obs": 262,
+      "num_envs": 8192,
+      "num_obs": 235,
+      "num_obs_history": 5,
+      "num_observations": 47,
+      "num_privileged_obs": 262,
+      "scene_extent": 2.0,
+      "seed": 0
+    },
+    "experiment": {
+      "actor_phase": true,
+      "contact_source": "model"
+    },
+    "init_member_classes": {},
+    "init_state": {
+      "default_joint": {
+        "FL_hip_joint": 0.0,
+        "FR_hip_joint": 0.0,
+        "RL_hip_joint": 0.0,
+        "RR_hip_joint": 0.0,
+        "FL_thigh_joint": 0.8,
+        "RL_thigh_joint": 0.8,
+        "FR_thigh_joint": -0.8,
+        "RR_thigh_joint": -0.8,
+        "FL_calf_joint": -1.6,
+        "RL_calf_joint": -1.6,
+        "FR_calf_joint": 1.6,
+        "RR_calf_joint": 1.6
+      },
+      "pos": [
+        0.0,
+        0.0,
+        0.158
+      ]
+    },
+    "noise": {
+      "add_noise": true,
+      "noise_level": 1.0,
+      "noise_scales": {
+        "base_ang_vel": 0.2,
+        "joint_pos": 0.01,
+        "joint_vel": 1.5,
+        "projected_gravity": 0.05
+      }
+    },
+    "reset": {
+      "base_offset": {
+        "pose_range": {
+          "x": [
+            -0.5,
+            0.5
+          ],
+          "y": [
+            -0.5,
+            0.5
+          ],
+          "z": [
+            0.01,
+            0.05
+          ],
+          "yaw": [
+            -3.14,
+            3.14
+          ]
+        },
+        "velocity_range": {}
+      },
+      "joint_offset": {
+        "position_range": [
+          0.0,
+          0.0
+        ],
+        "velocity_range": [
+          0.0,
+          0.0
+        ]
+      }
+    },
+    "reward": {
+      "body_ang_vel_frame": "body",
+      "fall_angle": 1.2217304763960306,
+      "fall_softness_deg": 5.0,
+      "foot_slip_command_threshold": 0.1,
+      "gait": {
+        "command_threshold": 0.1,
+        "contact_height": 0.02,
+        "contact_softness": 0.005,
+        "offsets": {
+          "FR": 0.0,
+          "FL": 0.5,
+          "RR": 0.5,
+          "RL": 0.0
+        },
+        "period": 0.5,
+        "stance_fraction": 0.56
+      },
+      "hip_pos_command_threshold": 0.1,
+      "leg_collision_force_threshold": 1.0,
+      "pose_tracking_gate": true,
+      "posture": {
+        "running_threshold": 1.5,
+        "std_running": {
+          "hip": 0.12,
+          "thigh": 0.28,
+          "calf": 0.4
+        },
+        "std_standing": {
+          "hip": 0.05,
+          "thigh": 0.1,
+          "calf": 0.15
+        },
+        "std_walking": {
+          "hip": 0.12,
+          "thigh": 0.28,
+          "calf": 0.4
+        },
+        "walking_threshold": 0.1
+      },
+      "scales": {
+        "action_rate_l2": -0.1,
+        "angular_momentum": -0.025,
+        "body_ang_vel": -0.05,
+        "body_orientation_l2": -0.2,
+        "feet_air_time": 0.2,
+        "foot_gait": 0.5,
+        "foot_slip": -0.1,
+        "hip_pos": -1.0,
+        "is_terminated": -100.0,
+        "joint_acc_l2": -3e-07,
+        "joint_pos_limits": -10.0,
+        "joint_torques_l2": -2e-05,
+        "leg_collision": -1.0,
+        "lin_vel_z": -2.0,
+        "pose": 0.5,
+        "smoothness": -0.01,
+        "soft_landing": -0.003,
+        "stand_still": -2.0,
+        "stand_still_joint_vel_l2": -0.1,
+        "stumble": -0.1,
+        "track_angular_velocity": 2.0,
+        "track_linear_velocity": 2.0
+      },
+      "soft_landing_command_threshold": 0.1,
+      "stand_still_command_threshold": 0.1,
+      "stumble_ratio": 5.0,
+      "tracking_angular_variance": 0.25,
+      "tracking_linear_frame": "body",
+      "tracking_linear_variance": 0.25
+    },
+    "runner": {
+      "actor_bf16": true,
+      "critic_bf16": true,
+      "critic_microbatch": 32768,
+      "cuda_graph": true,
+      "detailed_timing": false,
+      "driver": {
+        "expert_frac": 0.0,
+        "expert_policy": "",
+        "fade_iterations": [
+          1000000000,
+          1000000000
+        ],
+        "frac": 0.25,
+        "policy": ""
+      },
+      "enable_control_updates": true,
+      "fused_adam": true,
+      "imag_microbatch": 4096,
+      "log_interval": 1,
+      "max_iterations": 20000,
+      "metric_interval": 10,
+      "replay_history_storage": "frames",
+      "save_interval": 10000,
+      "standing_zero_noise": true,
+      "timing_interval": 1,
+      "wm_bf16": true,
+      "wm_compile": true
+    },
+    "sim": {
+      "broadphase": "nxn",
+      "ccd_iterations": 50,
+      "iterations": 10,
+      "ls_iterations": 20,
+      "nconmax": null,
+      "njmax": 300,
+      "solver": "cg",
+      "timestep": 0.005
+    },
+    "terrain": {
+      "box_grid_height_range": [
+        0.01,
+        0.055
+      ],
+      "core_rows": 6,
+      "curriculum": true,
+      "curriculum_iterations": 12000,
+      "field_cache_dir": "logs/heightfields",
+      "field_half_m": 6.5,
+      "field_resolution_m": 0.02,
+      "max_init_level": 0,
+      "mode": "rough",
+      "num_cols": 20,
+      "outer_flat_width_m": 20.0,
+      "patch_size_m": [
+        8.0,
+        8.0
+      ],
+      "scan_resolution_m": 0.072,
+      "scan_size_m": [
+        0.72,
+        0.432
+      ],
+      "seed": null,
+      "stair_dimensions": [
+        [
+          0.1,
+          1.2
+        ],
+        [
+          0.11,
+          1.1
+        ],
+        [
+          0.12,
+          1.05
+        ],
+        [
+          0.14,
+          0.95
+        ]
+      ],
+      "stair_height_range": [
+        0.03,
+        0.1
+      ]
+    },
+    "to_dict": {},
+    "viewer": {
+      "azimuth": 90.0,
+      "distance": 1.0,
+      "elevation": -10.0
+    }
+  },
+  "spec_hash": "38bd5297c1157c0825a17b2226dd87b98455c0091e4d2fd2d9dad0f2035c0796",
+  "geometry_hash": "5a3668ee0a3e2cc23b81c5ed256860c4633cb8f247eaaf9f651b40f848d41f80"
+}
